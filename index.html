@@ -51,6 +51,17 @@
   }
   #toast.show { opacity: 1; }
 
+  #zoomctl {
+    position: absolute; right: 8px; top: 8px; display: flex; flex-direction: column; gap: 5px;
+  }
+  #zoomctl button {
+    width: 36px; height: 36px; border-radius: 9px;
+    background: rgba(29,39,51,.82); color: var(--ink);
+    border: 1px solid var(--line); font-size: 20px; font-weight: 700; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #zoomctl button:active { background: #2e4257; }
+
   #panel {
     flex: 0 0 auto; background: var(--panel);
     border-top: 1px solid var(--line); padding: 8px;
@@ -120,12 +131,17 @@
   <div id="stage">
     <canvas id="cv"></canvas>
     <div id="toast"></div>
+    <div id="zoomctl">
+      <button id="zin" aria-label="zoom in">+</button>
+      <button id="zout" aria-label="zoom out">−</button>
+      <button id="zhome" aria-label="recenter">⌖</button>
+    </div>
   </div>
   <div id="panel">
     <div id="sel">Tap a hex to inspect. Tap a forest, quarry, cow or marauder to put a villager to work.</div>
     <div id="actions"></div>
     <div id="log"></div>
-    <div id="hint">Tap a hex + swipe up = raise · swipe down = lower. Or use the buttons.</div>
+    <div id="hint">Tap a hex to act · swipe a hex up/down to raise/lower · pinch or +/− to zoom · two-finger drag to pan.</div>
   </div>
   <div id="event" class="hidden">
     <div class="ebox" id="ebox">
@@ -151,7 +167,7 @@
 // ---------- hex math (pointy-top, axial q,r) ----------
 const SQ3 = Math.sqrt(3);
 let HEX = 26;                // hex radius in px (recomputed to fit)
-const ELEV = 11;             // px lift per raised level (hills/mountains)
+const ELEV = 4;              // px lift per raised level — kept small for a top-down, unobstructed view
 const DIRS = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
 const key = (q,r)=>q+","+r;
 
@@ -1388,11 +1404,51 @@ function handleTap(h){
   else if (!ent && t.improve && t.improve.kind==="farm") assignNearest("farm", h);
   refreshPanel();
 }
-cv.addEventListener("pointerdown",e=>onDown(e.clientX,e.clientY));
-cv.addEventListener("pointermove",e=>onMove(e.clientX,e.clientY));
-cv.addEventListener("pointerup",e=>onUp(e.clientX,e.clientY));
-cv.addEventListener("pointercancel",()=>{ clearHold(); down=null; });
-cv.addEventListener("contextmenu",e=>e.preventDefault());
+// ---- zoom & pan: two-finger pinch/drag (touch), wheel (desktop), mouse drag ----
+const pointers = new Map();
+let pinch = null, mousePan = null;
+const canvasXY = e => { const r=cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top }; };
+function startPinch(){
+  const p=[...pointers.values()];
+  pinch = { dist:Math.hypot(p[0].x-p[1].x, p[0].y-p[1].y), mx:(p[0].x+p[1].x)/2, my:(p[0].y+p[1].y)/2 };
+}
+function onPointerDown(e){
+  const p=canvasXY(e); pointers.set(e.pointerId, p);
+  if (pointers.size>=2){ clearHold(); down=null; mousePan=null; startPinch(); return; }
+  if (e.pointerType==="mouse"){ mousePan={ x:p.x, y:p.y, moved:false, hex:evToHex(e.clientX,e.clientY) }; return; }
+  onDown(e.clientX, e.clientY);                    // single touch -> tap/swipe/hold
+}
+function onPointerMove(e){
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, canvasXY(e));
+  if (pinch && pointers.size>=2){
+    const p=[...pointers.values()];
+    const dist=Math.hypot(p[0].x-p[1].x, p[0].y-p[1].y), mx=(p[0].x+p[1].x)/2, my=(p[0].y+p[1].y)/2;
+    if (pinch.dist>0) zoomAt(dist/pinch.dist, mx, my);
+    cam.x += mx-pinch.mx; cam.y += my-pinch.my; clampCam();
+    pinch={dist,mx,my}; return;
+  }
+  if (mousePan){
+    const p=canvasXY(e), dx=p.x-mousePan.x, dy=p.y-mousePan.y;
+    if (mousePan.moved || Math.hypot(dx,dy)>4){ mousePan.moved=true; cam.x+=dx; cam.y+=dy; clampCam(); mousePan.x=p.x; mousePan.y=p.y; }
+    return;
+  }
+  onMove(e.clientX, e.clientY);
+}
+function onPointerUp(e){
+  pointers.delete(e.pointerId);
+  if (pinch){ if (pointers.size<2) pinch=null; else startPinch(); return; }
+  if (mousePan){
+    if (!mousePan.moved){ if (mousePan.hex) handleTap(mousePan.hex); else { G.selHex=null; refreshPanel(); } }
+    mousePan=null; return;
+  }
+  onUp(e.clientX, e.clientY);
+}
+cv.addEventListener("pointerdown", onPointerDown);
+cv.addEventListener("pointermove", onPointerMove);
+cv.addEventListener("pointerup", onPointerUp);
+cv.addEventListener("pointercancel", e=>{ pointers.delete(e.pointerId); pinch=null; mousePan=null; clearHold(); down=null; });
+cv.addEventListener("wheel", e=>{ e.preventDefault(); const p=canvasXY(e); zoomAt(e.deltaY<0?1.12:1/1.12, p.x, p.y); }, {passive:false});
+cv.addEventListener("contextmenu", e=>e.preventDefault());
 
 // ---------- colour helpers ----------
 function mix(c, amt){ // amt>0 lighten toward white, <0 darken toward black
@@ -1415,30 +1471,48 @@ for (let i=0;i<6;i++){
 
 // ---------- rendering ----------
 const ctx = cv.getContext("2d");
-let DPR = 1;
+let DPR = 1, fitHEX = 26, VW = 360, VH = 480, zoom = 1;
+const gridU = { minX:0, maxX:0, minY:0, maxY:0 };
+const clampN = (v,a,b)=>Math.max(a,Math.min(b,v));
+function computeGridU(){
+  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+  for (const t of G.map.values()){
+    const p = uPix(t.q,t.r);
+    minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
+    minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
+  }
+  gridU.minX=minX-1; gridU.maxX=maxX+1; gridU.minY=minY-1; gridU.maxY=maxY+1;
+}
 function resize(){
   const stage = document.getElementById("stage");
   DPR = Math.min(window.devicePixelRatio||1, 2);
-  const w = stage.clientWidth, hgt = stage.clientHeight;
-  cv.width = w*DPR; cv.height = hgt*DPR;
+  VW = stage.clientWidth; VH = stage.clientHeight;
+  cv.width = VW*DPR; cv.height = VH*DPR;
   ctx.setTransform(DPR,0,0,DPR,0,0);
-  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
-  for (const t of G.map.values()){
-    const p = hexToPixel(t.q,t.r);
-    minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
-    minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
-  }
-  const gw=(maxX-minX)+HEX*2, gh=(maxY-minY)+HEX*2+ELEV*E_MAX+HEX;
-  const scale = Math.min(w/gw, hgt/gh, 1.3);
-  HEX = HEX*scale;
-  minX=1e9;maxX=-1e9;minY=1e9;maxY=-1e9;
-  for (const t of G.map.values()){
-    const p = hexToPixel(t.q,t.r);
-    minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
-    minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
-  }
-  cam.x = w/2 - (minX+maxX)/2;
-  cam.y = hgt/2 - (minY+maxY)/2 + ELEV*E_MAX/2;  // bias so tall hills aren't clipped at top
+  computeGridU();
+  const gwU=(gridU.maxX-gridU.minX), ghU=(gridU.maxY-gridU.minY);
+  fitHEX = Math.min(VW/gwU, VH/ghU);
+  recenter();
+}
+function recenter(){
+  zoom = clampN(zoom, 0.85, 3.5);
+  HEX = fitHEX*zoom;
+  const cx=(gridU.minX+gridU.maxX)/2*HEX, cy=(gridU.minY+gridU.maxY)/2*HEX;
+  cam.x = VW/2 - cx; cam.y = VH/2 - cy + (ELEV*E_MAX)/2;
+  clampCam();
+}
+function clampCam(){
+  const gMinX=gridU.minX*HEX, gMaxX=gridU.maxX*HEX, gMinY=gridU.minY*HEX, gMaxY=gridU.maxY*HEX;
+  const m = HEX*1.2;
+  if ((gMaxX-gMinX) <= VW) cam.x = VW/2 - (gMinX+gMaxX)/2;
+  else cam.x = clampN(cam.x, VW-m-gMaxX, m-gMinX);
+  if ((gMaxY-gMinY) <= VH) cam.y = VH/2 - (gMinY+gMaxY)/2 + (ELEV*E_MAX)/2;
+  else cam.y = clampN(cam.y, VH-m-gMaxY, m-gMinY);
+}
+function zoomAt(factor, ax, ay){
+  const nh = clampN(HEX*factor, fitHEX*0.85, fitHEX*3.5), f = nh/HEX;
+  cam.x = ax - (ax-cam.x)*f; cam.y = ay - (ay-cam.y)*f;
+  HEX = nh; zoom = HEX/fitHEX; clampCam();
 }
 
 function corners(cx,cy){
@@ -1457,7 +1531,7 @@ function tileTop(t){
   if (shallowWater(t)) return mix(W_SHALL, 0.04);
   if (quarry(t))       return mix(ROCK, -0.12);
   if (mountain(t))     return mix(MOUNT, 0.10);
-  return mix(GRASS, t.elev*0.07);                 // hills brighter, dips darker — lighting, not colour
+  return mix(GRASS, t.elev*0.05);                 // hills brighter, dips darker — subtle lighting, not colour
 }
 
 let lastTs = 0;
@@ -1481,11 +1555,11 @@ function draw(ts){
 
     // raised: shaded side walls (the "mass" of hills) — strong highlight/shadow identity
     if (lift>0){
-      const sideBase = mix(top0, -0.30);
+      const sideBase = mix(top0, -0.16);
       const base = corners(cx, baseY);
       for (let i=0;i<6;i++){
         if (!EDGE[i].down) continue;               // draw only front-facing walls
-        const sh = -0.18 + 0.18*EDGE[i].lit;       // directional shade
+        const sh = -0.10 + 0.10*EDGE[i].lit;       // gentle directional shade
         ctx.fillStyle = rgb(mix(sideBase, sh));
         poly([top[i], top[(i+1)%6], base[(i+1)%6], base[i]]); ctx.fill();
       }
@@ -1497,15 +1571,15 @@ function draw(ts){
     // recessed look for dips / quarries / deep water: inner shadow ring
     if (t.elev<0){
       ctx.save(); poly(top); ctx.clip();
-      ctx.lineWidth = HEX*0.42; poly(top);
-      ctx.strokeStyle = `rgba(0,0,0,${t.elev<=-2?0.34:0.20})`; ctx.stroke();
+      ctx.lineWidth = HEX*0.34; poly(top);
+      ctx.strokeStyle = `rgba(0,0,0,${t.elev<=-2?0.20:0.12})`; ctx.stroke();
       ctx.restore();
     } else if (lift>0){
-      // crisp lit rim on the upper edges of raised tiles
+      // faint lit rim on the upper edges of raised tiles
       for (let i=0;i<6;i++){
         if (EDGE[i].down) continue;
         ctx.beginPath(); ctx.moveTo(top[i][0],top[i][1]); ctx.lineTo(top[(i+1)%6][0],top[(i+1)%6][1]);
-        ctx.strokeStyle="rgba(255,255,255,0.18)"; ctx.lineWidth=1.5; ctx.stroke();
+        ctx.strokeStyle="rgba(255,255,255,0.10)"; ctx.lineWidth=1.2; ctx.stroke();
       }
     }
 
@@ -1736,10 +1810,14 @@ function restart(){
   setupStart(); resize(); renderStats(); refreshPanel(); saveGame();
 }
 
+document.getElementById("zin").onclick  = ()=>zoomAt(1.25, VW/2, VH/2);
+document.getElementById("zout").onclick = ()=>zoomAt(1/1.25, VW/2, VH/2);
+document.getElementById("zhome").onclick= ()=>{ zoom=1; recenter(); };
+
 if (!loadGame()) setupStart();
 resize();
 renderStats(); refreshPanel();
-window.addEventListener("resize", ()=>{ HEX=26; resize(); });
+window.addEventListener("resize", resize);
 window.addEventListener("beforeunload", saveGame);
 document.addEventListener("visibilitychange", ()=>{ if(document.hidden) saveGame(); });
 draw();
