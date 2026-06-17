@@ -215,7 +215,7 @@ const G = {
   paused: false,     // true while an event modal is open
   alarm: false,      // bell raised -> villagers muster at the warehouse
   shots: [],         // transient watchtower arrow effects
-  nextEvent: 14,
+  nextEvent: 14, lastBadTick: -999,
   over: false,
 };
 let nextId = 1;
@@ -277,7 +277,7 @@ function removeEnt(id){ const i=G.ents.findIndex(e=>e.id===id); if(i>=0) G.ents.
 function setupStart(){
   genMap();
   G.ents.length = 0;
-  G.over=false; G.alarm=false; G.placing=null; G.paused=false; G.shots=[];
+  G.over=false; G.alarm=false; G.placing=null; G.paused=false; G.shots=[]; G.lastBadTick=-999;
   let home = null;
   for (let d=0; d<=RADIUS && !home; d++){
     for (const t of G.map.values()){
@@ -443,13 +443,25 @@ function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if
 function loseVillager(reason){
   const vs = G.ents.filter(e=>e.type==="villager");
   if (vs.length<=1){ return false; }
-  const v = pick(vs);
-  if (v.homeId){ const h=G.ents.find(e=>e.id===v.homeId); if(h) h.homeOf=null; }
-  removeEnt(v.id); G.pop--;
+  removeVillager(pick(vs));
   if (reason) log(reason);
   return true;
 }
-function fireEvent(){ openEvent(pick(EVENTS)); }
+// remove a villager, free its home, end the game if it was the last one
+function removeVillager(v){
+  if (v.homeId){ const h=G.ents.find(e=>e.id===v.homeId); if(h) h.homeOf=null; }
+  removeEnt(v.id); G.pop--;
+  if (G.pop<=0){ G.over=true; flash("Your last villager is gone — game over."); }
+}
+function fireEvent(){
+  // space out raids/disasters: bad events need a cooldown, good ones fill the gaps
+  const bad = EVENTS.filter(e=>e.bad), good = EVENTS.filter(e=>!e.bad);
+  let pool = good;
+  if (G.tick - (G.lastBadTick||-999) > 24 && Math.random()<0.5) pool = bad;
+  const ev = pick(pool);
+  if (ev.bad) G.lastBadTick = G.tick;
+  openEvent(ev);
+}
 
 // ---------- main logic tick ----------
 function logicTick(){
@@ -670,11 +682,14 @@ function finishRecover(v){
 }
 
 // ---------- combat resolution ----------
-function killVillager(v){
-  if (v.homeId){ const h=G.ents.find(e=>e.id===v.homeId); if(h) h.homeOf=null; }
-  removeEnt(v.id); G.pop--;
-  log("☠️ A villager was slain by raiders!");
-  if (G.pop<=0){ G.over=true; flash("Your last villager has fallen — game over."); }
+function killVillager(v){ removeVillager(v); log("☠️ A villager was slain by raiders!"); }
+// a villager strikes back when attacked — only a little, returns true if attacker dies
+function villagerFightsBack(villager, attacker){
+  if (Math.random() < 0.4){                  // weak retaliation vs tougher foes
+    attacker.hp -= 1;
+    if (attacker.hp<=0){ dropLoot(attacker); removeEnt(attacker.id); log("🛡️ A villager fought off a raider!"); return true; }
+  }
+  return false;
 }
 function destroyBuilding(b){
   if (b.type==="warehouse"){ removeEnt(b.id); G.over=true; log("💀 The warehouse has been destroyed!"); flash("Your warehouse is destroyed — game over."); return; }
@@ -712,12 +727,18 @@ function nearestOuterBuilding(from){
   }
   return best;
 }
-// attackers: kill villagers, raze outlying buildings, then the warehouse; some steal & flee
+function nearestCarrier(from){
+  let best=null, bd=1e9;
+  for (const e of G.ents){ if (e.type!=="villager" || !e.carry) continue; const d=hexDist(e,from); if (d<bd){ bd=d; best=e; } }
+  return best;
+}
+// attackers: thieves are fast and hunt laden villagers; raiders raze inward to the warehouse
 function marauderAct(e){
+  const spd = e.thief ? 0.6 : 0.34;        // thieves are fleet-footed
   // carrying loot -> flee back the way they came, off the map
   if (e.loot){
     const goal = e.spawn || {q:e.q,r:e.r};
-    const arr = stepToward(e, goal, false, 0.45);
+    const arr = stepToward(e, goal, false, spd);
     if (arr===true || hexDist(e,{q:0,r:0})>=RADIUS){
       log("🏴‍☠️ Raiders escaped with "+e.loot.amt+" "+e.loot.res+"!");
       flash("Raiders made off with your "+e.loot.res+"!");
@@ -725,16 +746,35 @@ function marauderAct(e){
     }
     return;
   }
-  // thieves snatch dropped loads lying in the open
   if (e.thief){
-    const item = nearestEntOfType(e, "item");
-    if (item){
-      const arr = stepToward(e, {q:item.q,r:item.r}, false, 0.45);
-      if (arr===true){ e.loot={res:item.res, amt:item.amt}; removeEnt(item.id); log("🏴‍☠️ A marauder snatched a dropped load!"); }
+    // 1) chase down a villager who is carrying a load and snatch it
+    const carrier = nearestCarrier(e);
+    if (carrier){
+      if (hexDist(e,carrier)<=1){
+        e.loot = { res:carrier.carry.res, amt:carrier.carry.amt };
+        carrier.carry = null;
+        log("🏴‍☠️ A thief waylaid a villager and stole their load!");
+        flash("A thief robbed one of your villagers!");
+        if (villagerFightsBack(carrier, e)) return;   // villager may drive the thief off
+      } else stepToward(e, {q:carrier.q,r:carrier.r}, true, spd);
       return;
     }
+    // 2) else snatch a dropped load lying in the open
+    const item = nearestEntOfType(e, "item");
+    if (item){
+      const arr = stepToward(e, {q:item.q,r:item.r}, false, spd);
+      if (arr===true){ e.loot={res:item.res, amt:item.amt}; removeEnt(item.id); log("🏴‍☠️ A thief snatched a dropped load!"); }
+      return;
+    }
+    // 3) else grab goods from the warehouse and flee
+    const wh = warehouse();
+    if (wh){
+      if (hexDist(e,wh)<=1){ const loot=grabFromWarehouse(); if (loot){ e.loot=loot; log("🏴‍☠️ A thief grabbed "+loot.amt+" "+loot.res+" from the warehouse!"); } }
+      else stepToward(e, {q:wh.q,r:wh.r}, true, spd);
+    }
+    return;
   }
-  // target priority: a nearby villager, else the nearest outlying building, else the warehouse
+  // raiders: nearby villager, else nearest outlying building, else the warehouse
   const tgt = nearestEntOfType(e, "villager", 3) || nearestOuterBuilding(e) || warehouse();
   if (!tgt) return;
   if (hexDist(e,tgt)<=1){
@@ -742,19 +782,37 @@ function marauderAct(e){
     if (e.acd>0) return;
     e.acd = 2;
     if (tgt.type==="villager"){
+      if (villagerFightsBack(tgt, e)) return;         // they trade blows
       tgt.hp = (tgt.hp||1) - 1;
       if (tgt.hp<=0) killVillager(tgt);
     } else {
-      if (tgt.type==="warehouse" && e.thief && Math.random()<0.5){
-        const loot = grabFromWarehouse();
-        if (loot){ e.loot=loot; log("🏴‍☠️ Raiders grabbed "+loot.amt+" "+loot.res+" from the warehouse!"); return; }
-      }
       tgt.hp = (tgt.hp||1) - 1;
       if (tgt.hp<=0) destroyBuilding(tgt);
     }
   } else {
-    stepToward(e, {q:tgt.q,r:tgt.r}, true, 0.34);
+    stepToward(e, {q:tgt.q,r:tgt.r}, true, spd);
   }
+}
+
+// flood: water widens by one tile in every direction, drowning what it touches
+function floodTiles(){
+  const toFlood = [];
+  for (const t of G.map.values()){
+    if (t.wet) continue;
+    if (DIRS.some(([dq,dr])=>{ const n=G.map.get(key(t.q+dq,t.r+dr)); return n && n.wet; })) toFlood.push(t);
+  }
+  for (const t of toFlood){ t.elev = Math.min(t.elev, -1); t.improve = null; }
+  computeWater();
+  let swept = 0;
+  for (const e of [...G.ents]){
+    const t = G.map.get(key(e.q,e.r));
+    if (!t || !t.wet) continue;                       // only things now underwater
+    if (e.type==="villager"){ removeVillager(e); swept++; }
+    else if (e.type==="house"||e.type==="watchtower"||e.type==="warehouse"){ destroyBuilding(e); swept++; }
+    else if (e.type==="cow"||e.type==="marauder"||e.type==="trader"||e.type==="item"){ removeEnt(e.id); swept++; }
+  }
+  log("🌊 The flood widened the waters"+(swept?" and swept away "+swept+" things!":"."));
+  flash("🌊 Flood! The waters spread.");
 }
 
 // ---------- watchtower placement & crewing ----------
@@ -908,7 +966,7 @@ const EVENTS = [
       { label:"Buy 5 wood (5🪙)", fn:()=>{ if(can({gold:5})){ pay({gold:5}); G.res.wood+=5; } else flash("Not enough gold."); } },
       { label:"Send him on his way", fn:()=>{} },
     ] },
-  { title:"Bandit Threat",
+  { title:"Bandit Threat", bad:true,
     text:"Rough men ring the village. Their leader demands a tribute of 6 gold, or they will take it by force.",
     options:[
       { label:"Pay the tribute (6🪙)", fn:()=>{ if(can({gold:6})){ pay({gold:6}); } else { flash("You can't pay — they attack!"); spawnMarauders(2);} } },
@@ -923,7 +981,7 @@ const EVENTS = [
       { label:"Welcome them in", fn:()=>{ const h=placeHouse(warehouse()); if(h){ spawnVillager(warehouse().q,warehouse().r); G.pop++; flash("The family joins your village!"); } else flash("No room to settle them."); } },
       { label:"Turn them away", fn:()=>{} },
     ] },
-  { title:"A Fever Spreads",
+  { title:"A Fever Spreads", bad:true,
     text:"A sickness creeps from house to house. The healers can hold it back — for a price.",
     options:[
       { label:"Pay the healers (6🪙)", fn:()=>{ if(can({gold:6})) pay({gold:6}); else { flash("No gold for healers…"); loseVillager("☠️ The fever took a villager."); } } },
@@ -944,18 +1002,48 @@ const EVENTS = [
       { label:"Invite them in", fn:()=>{ spawnTrader(); flash("Send a villager to trade."); } },
       { label:"Ignore them", fn:()=>{} },
     ] },
-  { title:"Marauders Sighted!",
+  { title:"Marauders Sighted!", bad:true,
     text:"Scouts come running — a warband marches on the village from the wilds!",
     options:[
       { label:"🔔 Sound the alarm", fn:()=>{ spawnMarauders(2+rnd(2)); ringBell(); } },
       { label:"Stand and fight", fn:()=>{ spawnMarauders(2+rnd(2)); } },
     ] },
-  { title:"A Dry Spell",
+  { title:"Thieves in the Night", bad:true,
+    text:"Word spreads of nimble thieves prowling the roads — they prey on villagers hauling goods.",
+    options:[
+      { label:"Recall the haulers (🔔)", fn:()=>{ for(let i=0;i<2;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder",q:t.q,r:t.r,hp,maxhp:hp,mp:0,acd:0,spawn:{q:t.q,r:t.r},thief:true,loot:null}); } } ringBell(); } },
+      { label:"Carry on regardless", fn:()=>{ for(let i=0;i<2;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder",q:t.q,r:t.r,hp,maxhp:hp,mp:0,acd:0,spawn:{q:t.q,r:t.r},thief:true,loot:null}); } } } },
+    ] },
+  { title:"The River Floods", bad:true,
+    text:"Storms swell the waters upstream. The river breaks its banks and surges across the low ground — get clear of the water!",
+    options:[ { label:"Brace the village", fn:()=>{ floodTiles(); } } ] },
+  { title:"A Dry Spell", bad:true,
     text:"The wells run shallow and the crops droop in the heat.",
     options:[ { label:"Ration carefully (-4 food)", fn:()=>{ G.res.food=Math.max(0,G.res.food-4); } } ] },
   { title:"Old Ruins Found",
     text:"Children playing in the brush uncover a tumble of old worked stone and rotting timber.",
     options:[ { label:"Salvage it (+3 wood, +3 stone)", fn:()=>{ G.res.wood+=3; G.res.stone+=3; } } ] },
+  { title:"A Fine Hunt",
+    text:"Scouts spy a herd of deer grazing the far meadows. A hunting party could bring back meat and hides.",
+    options:[
+      { label:"Send hunters (+5 food, +2 hide)", fn:()=>{ G.res.food+=5; G.res.leather+=2; } },
+      { label:"Leave them be", fn:()=>{} },
+    ] },
+  { title:"Wild Boar",
+    text:"A great boar roots through the woods at the village edge — dangerous, but good eating.",
+    options:[
+      { label:"Hunt it (+6 food)", fn:()=>{ if(Math.random()<0.25){ flash("The boar gored a villager!"); loseVillager("☠️ The boar killed a hunter."); } else { G.res.food+=6; flash("The boar is felled! +6 food"); } } },
+      { label:"Let it pass", fn:()=>{} },
+    ] },
+  { title:"Wandering Bard",
+    text:"A bard offers songs of far-off lands in exchange for a warm hearth and a coin.",
+    options:[
+      { label:"Welcome the bard (+3 gold of trade)", fn:()=>{ G.res.gold+=3; } },
+      { label:"No time for songs", fn:()=>{} },
+    ] },
+  { title:"Beekeepers' Boon",
+    text:"Wild hives in the meadow brim with honey and the cattle have calved well.",
+    options:[ { label:"Gather the bounty (+4 milk, +3 food)", fn:()=>{ G.res.milk+=4; G.res.food+=3; } } ] },
 ];
 
 const eventEl=document.getElementById("event"), eTitle=document.getElementById("etitle"),
@@ -1426,7 +1514,8 @@ function drawEntity(e,cx,cy){
       ctx.fillText("$",cx,cy+1);
       break;
     case "marauder":
-      ctx.fillStyle="#e3604f"; ctx.strokeStyle="#5c1f17"; ctx.lineWidth=1.2;
+      ctx.fillStyle = e.thief ? "#c77fd6" : "#e3604f";    // thieves are purple, raiders red
+      ctx.strokeStyle = e.thief ? "#5a2a66" : "#5c1f17"; ctx.lineWidth=1.2;
       ctx.beginPath(); ctx.moveTo(cx,cy-s*0.5); ctx.lineTo(cx+s*0.5,cy+s*0.4); ctx.lineTo(cx-s*0.5,cy+s*0.4); ctx.closePath();
       ctx.fill(); ctx.stroke();
       ctx.fillStyle="#fff"; ctx.font=`${s*0.5}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle";
