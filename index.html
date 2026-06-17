@@ -12,9 +12,6 @@
     --panel2: #243140;
     --ink: #e8eef5;
     --muted: #9fb0c2;
-    --accent: #5ec27a;
-    --gold: #f2c94c;
-    --danger: #e3604f;
     --line: #32445a;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -27,7 +24,6 @@
   }
   #app { display: flex; flex-direction: column; height: 100%; }
 
-  /* ---- top stat bar ---- */
   #stats {
     display: flex; gap: 4px; padding: 6px 8px;
     background: var(--panel); border-bottom: 1px solid var(--line);
@@ -42,11 +38,9 @@
   .stat .val { font-size: 14px; font-weight: 700; margin-top: 1px; }
   .stat .lb { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
 
-  /* ---- canvas ---- */
   #stage { position: relative; flex: 1 1 auto; min-height: 0; }
   canvas { display: block; width: 100%; height: 100%; }
 
-  /* event toast */
   #toast {
     position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
     background: rgba(20,26,36,.92); border: 1px solid var(--line);
@@ -57,7 +51,6 @@
   }
   #toast.show { opacity: 1; }
 
-  /* ---- bottom panel ---- */
   #panel {
     flex: 0 0 auto; background: var(--panel);
     border-top: 1px solid var(--line); padding: 8px;
@@ -105,13 +98,18 @@
 "use strict";
 /* ============================================================
    HEX VILLAGE — a lightweight terraforming village sim
-   Single-file, no dependencies. Touch + mouse.
+   Single terrain (grass). Elevation -2..+3 drives everything;
+   lighting/shadow (not colour) conveys height.
+     +3 mountain (impassable)   +2 big hill   +1 small hill
+      0 flat grass
+     -1 dip  (or shallow water if touching the sea — crossable)
+     -2 quarry (or deep water if touching the sea — impassable)
    ============================================================ */
 
 // ---------- hex math (pointy-top, axial q,r) ----------
 const SQ3 = Math.sqrt(3);
-let HEX = 26;                 // hex radius in px (recomputed to fit)
-const ELEV = 5;              // px lift per height level
+let HEX = 26;                // hex radius in px (recomputed to fit)
+const ELEV = 11;             // px lift per raised level (hills/mountains)
 const DIRS = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
 const key = (q,r)=>q+","+r;
 
@@ -132,28 +130,42 @@ function hexDist(a,b){
   return (Math.abs(a.q-b.q) + Math.abs(a.q+a.r-b.q-b.r) + Math.abs(a.r-b.r))/2;
 }
 
-// ---------- terrain ----------
-// height 0 deep water,1 shallow water,2 sand,3 grass,4 hills,5 mountain
-const TERR = [
-  { name:"deep water", top:"#15557f", side:"#0e3c5c" },
-  { name:"water",      top:"#1f74a3", side:"#155777" },
-  { name:"sand",       top:"#d8c479", side:"#b3a25f" },
-  { name:"grass",      top:"#5fa64a", side:"#3f7833" },
-  { name:"hills",      top:"#3f7e34", side:"#2c5a25" },
-  { name:"mountain",   top:"#9aa0a6", side:"#6f747a" },
-];
-const isWater = h => h <= 1;
-const isWalkable = h => h >= 2 && h <= 4; // can't stand on deep mountain peak(5) or water
+// ---------- materials (grass is the only terrain; rest is water/rock) ----------
+const GRASS   = [95,166,74];
+const W_DEEP  = [20,72,110];
+const W_SHALL = [46,128,176];
+const ROCK    = [128,122,114];
+const MOUNT   = [150,150,156];
+
+// elevation limits
+const E_MIN = -2, E_MAX = 3;
+
+// ---------- terrain classification (depends on water flood) ----------
+function isWalkable(t){ return t && t.elev >= -1 && t.elev <= 2; } // -2 & +3 are impassable
+function deepWater(t){ return t.wet && t.elev <= -2; }
+function shallowWater(t){ return t.wet && t.elev === -1; }
+function quarry(t){ return !t.wet && t.elev <= -2; }
+function mountain(t){ return t.elev >= 3; }
+function tileName(t){
+  if (deepWater(t)) return "deep water";
+  if (shallowWater(t)) return "shallow water";
+  if (quarry(t)) return "quarry";
+  if (mountain(t)) return "mountain";
+  if (t.elev === -1) return "dip";
+  if (t.elev === 1) return "small hill";
+  if (t.elev === 2) return "big hill";
+  return "flat grassland";
+}
 
 // ---------- game state ----------
 const G = {
-  map: new Map(),       // key -> {q,r,height,improve}
-  ents: [],             // entities {id,type,q,r,...}
+  map: new Map(),
+  ents: [],
   res: { food:8, milk:0, wood:6, gold:5 },
   pop: 0, popCap: 3,
   day: 0, tick: 0,
-  selHex: null,         // {q,r}
-  ready: false,         // a house is "commanding"
+  selHex: null,
+  ready: false,
   nextEvent: 14,
   over: false,
 };
@@ -163,31 +175,49 @@ const RADIUS = 4;
 const rnd = (n)=>Math.floor(Math.random()*n);
 const pick = (a)=>a[rnd(a.length)];
 
+// ---------- water flood: sea spreads inland through low ground ----------
+function isSource(t){ return t.isSea && t.elev <= -2; }
+function computeWater(){
+  for (const t of G.map.values()) t.wet = false;
+  const stack = [];
+  for (const t of G.map.values()) if (isSource(t)){ t.wet = true; stack.push(t); }
+  while (stack.length){
+    const t = stack.pop();
+    for (const [dq,dr] of DIRS){
+      const n = G.map.get(key(t.q+dq, t.r+dr));
+      if (!n || n.wet) continue;
+      if (n.elev <= -1 || isSource(n)){ n.wet = true; stack.push(n); }
+    }
+  }
+}
+
 // ---------- map generation ----------
 function genMap(){
   G.map.clear();
   for (let q=-RADIUS; q<=RADIUS; q++){
     for (let r=-RADIUS; r<=RADIUS; r++){
       if (Math.abs(q+r) > RADIUS) continue;
-      let h = 3; // grass default
-      const edge = (q + r); // diagonal gradient -> coastline on one side
-      if (edge <= -3) h = 0;
-      else if (edge <= -2) h = 1;
+      const t = { q, r, elev:0, improve:null, isSea:false, wet:false };
+      const edge = q + r;
+      if (edge <= -3){ t.isSea = true; t.elev = -2; }      // the sea (deep, water source)
+      else if (edge === -2){ t.elev = -1; }                // coastline shallows
       else {
         const rr = Math.random();
-        if (rr < 0.05) h = 5;
-        else if (rr < 0.20) h = 4;
-        else if (rr < 0.27) h = 2;
+        if (rr < 0.06) t.elev = 2;                         // a few big hills
+        else if (rr < 0.20) t.elev = 1;                    // some small hills
       }
-      G.map.set(key(q,r), { q, r, height:h, improve:null });
+      G.map.set(key(q,r), t);
     }
   }
-  // scatter a few forests on grass/hills
+  // scatter forests on flat / low-hill grass
   let forests = 0;
   for (const t of G.map.values()){
     if (forests >= 6) break;
-    if ((t.height===3||t.height===4) && Math.random()<0.18){ t.improve = { kind:"forest", wood: 4 + rnd(4) }; forests++; }
+    if (t.elev>=0 && t.elev<=1 && !t.improve && Math.random()<0.16){
+      t.improve = { kind:"forest", wood: 4 + rnd(4) }; forests++;
+    }
   }
+  computeWater();
 }
 
 // ---------- entities ----------
@@ -198,16 +228,14 @@ function removeEnt(id){ const i=G.ents.findIndex(e=>e.id===id); if(i>=0) G.ents.
 function setupStart(){
   genMap();
   G.ents.length = 0;
-  // find a grass hex near centre for the house
   let home = null;
   for (let d=0; d<=RADIUS && !home; d++){
     for (const t of G.map.values()){
-      if (hexDist(t,{q:0,r:0})===d && t.height===3 && !t.improve){ home=t; break; }
+      if (hexDist(t,{q:0,r:0})===d && t.elev===0 && !t.improve){ home=t; break; }
     }
   }
-  if (!home){ home = G.map.get(key(0,0)); home.height = 3; }
+  if (!home){ home = G.map.get(key(0,0)); home.elev = 0; home.isSea=false; computeWater(); }
   addEnt({ type:"house", q:home.q, r:home.r });
-  // two villagers next to home
   spawnVillager(home.q, home.r);
   spawnVillager(home.q, home.r);
   G.pop = 2;
@@ -215,13 +243,12 @@ function setupStart(){
 }
 
 function spawnVillager(q,r){
-  // place on a walkable neighbour, else on the hex
   let spot = {q,r};
   for (const [dq,dr] of DIRS){
     const t = G.map.get(key(q+dq,r+dr));
-    if (t && isWalkable(t.height) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
+    if (t && isWalkable(t) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
   }
-  return addEnt({ type:"villager", q:spot.q, r:spot.r, px:spot.q, pr:spot.r, task:null, work:0, path:null });
+  return addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0 });
 }
 
 // ---------- pathfinding (BFS over walkable) ----------
@@ -240,17 +267,15 @@ function bfsNext(from, goal, goalAdjacentOk){
       const t = G.map.get(k);
       if (!t || seen.has(k)) continue;
       const isGoal = (nq===goal.q && nr===goal.r);
-      if (!isWalkable(t.height) && !isGoal) continue;
-      if (isGoal && !isWalkable(t.height) && !goalAdjacentOk) continue;
+      if (!isWalkable(t) && !(isGoal && !goalAdjacentOk)) continue;
       seen.set(k, key(cur.q,cur.r));
       queue.push({q:nq,r:nr});
     }
   }
   if (!reached) return null;
-  // walk back to find first step
   let k = key(reached.q,reached.r);
   let prev = seen.get(k);
-  if (prev === start || prev == null) return reached; // first step
+  if (prev === start || prev == null) return reached;
   while (prev && prev !== start){ k = prev; prev = seen.get(k); }
   const [q,r] = k.split(",").map(Number);
   return {q,r};
@@ -266,7 +291,6 @@ function nearestIdleVillager(q,r){
   }
   return best;
 }
-
 function assignTask(kind, target){
   const v = nearestIdleVillager(target.q, target.r);
   if (!v){ flash("All villagers are busy."); return false; }
@@ -275,14 +299,14 @@ function assignTask(kind, target){
   return true;
 }
 
-// ---------- the things you can do to a hex ----------
+// ---------- terraform ----------
 function terraform(q,r,dir){
   const t = G.map.get(key(q,r));
   if (!t) return;
-  if (dir>0 && t.height>=5){ flash("Already a mountain peak."); return; }
-  if (dir<0 && t.height<=0){ flash("Already deep water."); return; }
+  if (dir>0 && t.elev>=E_MAX){ flash("Already a mountain peak."); return; }
+  if (dir<0 && t.elev<=E_MIN){ flash(deepWater(t)?"Already deep water.":"Already a quarry."); return; }
   if (assignTask(dir>0?"raise":"lower", {q,r})){
-    flash((dir>0?"Raising":"Lowering")+" the "+TERR[t.height].name+"…");
+    flash((dir>0?"Raising":"Lowering")+" the "+tileName(t)+"…");
   }
 }
 
@@ -290,13 +314,10 @@ function terraform(q,r,dir){
 function spawnEdgeHex(walkableOnly){
   const edge = [];
   for (const t of G.map.values()){
-    if (hexDist(t,{q:0,r:0})>=RADIUS-1){
-      if (!walkableOnly || isWalkable(t.height)) edge.push(t);
-    }
+    if (hexDist(t,{q:0,r:0})>=RADIUS-1 && (!walkableOnly || isWalkable(t))) edge.push(t);
   }
-  return edge.length? pick(edge) : null;
+  return edge.length ? pick(edge) : null;
 }
-
 function fireEvent(){
   const roll = Math.random();
   if (roll < 0.34){
@@ -313,7 +334,7 @@ function fireEvent(){
     const t = spawnEdgeHex(true); if(!t) return;
     const hp = 2 + rnd(2);
     addEnt({ type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, moveCd: 3 });
-    log("⚔️ Marauders approach the village! Send a villager to fight, or they will raid you.");
+    log("⚔️ Marauders approach the village! Fight them, or wall them out with hills & water.");
     flash("⚔️ Marauders approach!");
   }
 }
@@ -324,23 +345,21 @@ function logicTick(){
   G.tick++;
   const house = G.ents.find(e=>e.type==="house");
 
-  // event timer
   if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 16 + rnd(14); }
 
-  // villagers
   for (const v of G.ents){
-    if (v.type!=="villager") continue;
-    if (!v.task){ continue; }
+    if (v.type!=="villager" || !v.task) continue;
     const tk = v.task;
-    // resolve a possibly-moved entity target
     let tq = tk.q, tr = tk.r;
     if (tk.targetId){
       const te = G.ents.find(e=>e.id===tk.targetId);
-      if (!te){ v.task=null; continue; }   // target gone
+      if (!te){ v.task=null; continue; }
       tq = te.q; tr = te.r;
     }
     const targetTile = G.map.get(key(tq,tr));
-    const needAdjacent = targetTile ? !isWalkable(targetTile.height) : true; // water/peak/entity-on-water
+    // terraforming is always done from an adjacent tile (never stand on the edited hex)
+    const needAdjacent = (tk.kind==="raise"||tk.kind==="lower"||tk.kind==="mine") ? true
+                         : !isWalkable(targetTile);
     const atTarget = (v.q===tq && v.r===tr) || (needAdjacent && hexDist(v,{q:tq,r:tr})===1);
     if (!atTarget){
       const step = bfsNext({q:v.q,r:v.r}, {q:tq,r:tr}, needAdjacent);
@@ -348,12 +367,10 @@ function logicTick(){
       v.q = step.q; v.r = step.r;
       continue;
     }
-    // at target: perform work
     v.work++;
     doWork(v, tk, tq, tr);
   }
 
-  // entity behaviour
   for (const e of [...G.ents]){
     if (e.type==="cow"){
       if (--e.timer<=0){ removeEnt(e.id); log("🐄 The cows wandered off."); }
@@ -366,8 +383,6 @@ function logicTick(){
           const step = bfsNext({q:e.q,r:e.r}, {q:house.q,r:house.r}, true);
           if (step){ e.q=step.q; e.r=step.r; }
           if (hexDist(e,house)<=1){
-            // raid!
-            const lost = Math.min(G.res.food, 3) + Math.min(G.res.gold,2);
             G.res.food = Math.max(0, G.res.food-3);
             G.res.gold = Math.max(0, G.res.gold-2);
             removeEnt(e.id);
@@ -380,11 +395,9 @@ function logicTick(){
   }
 
   // passive economy
-  let food = G.res.food, milk = G.res.milk;
-  for (const t of G.map.values()){
-    if (t.improve && t.improve.kind==="farm") food += 0.22;
-  }
-  food -= G.pop * 0.05;            // villagers eat
+  let food = G.res.food;
+  for (const t of G.map.values()) if (t.improve && t.improve.kind==="farm") food += 0.22;
+  food -= G.pop * 0.05;
   if (food < 0){
     food = 0;
     if (Math.random()<0.15 && G.pop>1){
@@ -392,19 +405,14 @@ function logicTick(){
       if (v){ removeEnt(v.id); G.pop--; log("☠️ A villager starved. Keep food positive!"); }
     }
   }
-  G.res.food = food; G.res.milk = milk;
+  G.res.food = food;
 
-  // population growth
   if (G.res.food >= 12 && G.pop < G.popCap){
     G.res.food -= 10; G.pop++;
-    const house2 = G.ents.find(e=>e.type==="house");
-    if (house2){ spawnVillager(house2.q, house2.r); log("👶 A new villager joins the village!"); flash("A new villager is born!"); }
+    if (house){ spawnVillager(house.q, house.r); log("👶 A new villager joins the village!"); flash("A new villager is born!"); }
   }
 
-  // day counter
-  if (G.tick % 10 === 0){ G.day++; }
-
-  // lose condition
+  if (G.tick % 10 === 0) G.day++;
   if (G.pop<=0){ G.over=true; log("Your village has fallen. Tap Restart."); flash("Game over — your village is empty."); }
 
   renderStats();
@@ -415,19 +423,39 @@ function doWork(v, tk, tq, tr){
   const tile = G.map.get(key(tq,tr));
   switch (tk.kind){
     case "raise":
-      if (v.work>=3){ if(tile.height<5) tile.height++; v.task=null; log("⛰️ Land raised to "+TERR[tile.height].name+"."); }
+      if (v.work>=3){
+        if (tile.elev<E_MAX) tile.elev++;
+        if (tile.elev > -2) tile.isSea = false;            // raised out of the sea -> reclaimed land
+        if (tile.improve && tile.improve.kind==="quarry" && tile.elev>-2) tile.improve=null;
+        computeWater(); v.task=null;
+        log("⛰️ Land raised — now "+tileName(tile)+".");
+      }
       break;
     case "lower":
-      if (v.work>=3){ if(tile.height>0) tile.height--; v.task=null; log("🌊 Land lowered to "+TERR[tile.height].name+"."); }
+      if (v.work>=3){
+        if (tile.elev>E_MIN) tile.elev--;
+        computeWater();
+        if (quarry(tile) && !tile.improve) tile.improve={kind:"quarry", stone:4+rnd(4)};
+        v.task=null;
+        log("🌊 Land lowered — now "+tileName(tile)+".");
+      }
       break;
     case "farm":
       if (v.work>=3){ tile.improve={kind:"farm"}; v.task=null; log("🌾 A farm is built — it yields food each day."); }
       break;
     case "chop":
       if (v.work>=3){
-        const w = (tile.improve&&tile.improve.wood)||3;
-        G.res.wood += w; tile.improve=null; v.task=null;
+        const w=(tile.improve&&tile.improve.wood)||3;
+        G.res.wood+=w; tile.improve=null; v.task=null;
         log("🪵 Gathered "+w+" wood from the forest.");
+      }
+      break;
+    case "mine":
+      if (v.work>=4){
+        const s=(tile.improve&&tile.improve.stone)||4;
+        G.res.gold+=s; tile.improve=null; v.task=null;
+        log("⛏️ Mined the quarry for "+s+" gold worth of stone.");
+        flash("+"+s+" gold from the quarry!");
       }
       break;
     case "build":
@@ -441,8 +469,7 @@ function doWork(v, tk, tq, tr){
     case "tend": {
       const cow = G.ents.find(e=>e.id===tk.targetId);
       if (!cow){ v.task=null; break; }
-      if (v.work % 2 === 0){ G.res.milk += 1; }
-      // keep tending; villager frees when cow leaves (handled by target gone)
+      if (v.work % 2 === 0) G.res.milk += 1;
       break;
     }
     case "trade": {
@@ -456,7 +483,7 @@ function doWork(v, tk, tq, tr){
           G.res.milk -= sellMilk; G.res.food -= sellFood; G.res.gold += gold;
           log("🪙 Sold goods to traders for "+gold+" gold.");
           flash("+"+gold+" gold from trade!");
-        } else { flash("Nothing to sell."); }
+        } else flash("Nothing to sell.");
         v.task=null;
       }
       break;
@@ -468,8 +495,7 @@ function doWork(v, tk, tq, tr){
         m.hp--;
         if (m.hp<=0){
           removeEnt(m.id); v.task=null;
-          const reward = 2 + rnd(3);
-          G.res.gold += reward;
+          const reward = 2 + rnd(3); G.res.gold += reward;
           log("🛡️ Marauder defeated! Looted "+reward+" gold.");
           flash("Marauder defeated! +"+reward+" gold");
         }
@@ -531,35 +557,35 @@ function refreshPanel(){
   const t = G.map.get(key(h.q,h.r));
   if (!t){ G.selHex=null; renderActions([]); return; }
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
-  let desc = `<b>${TERR[t.height].name}</b> (height ${t.height})`;
-  if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest" : " · 🌾 farm";
+  let desc = `<b>${tileName(t)}</b> · elev ${t.elev>0?"+":""}${t.elev}`;
+  if (!isWalkable(t)) desc += " · impassable";
+  if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest"
+                       : t.improve.kind==="quarry" ? " · ⛏️ stone"
+                       : " · 🌾 farm";
   if (ent) desc += " · "+entLabel(ent.type);
   selEl.innerHTML = desc;
 
-  // contextual actions
-  if (ent && ent.type==="house"){
+  if (ent && ent.type==="house")
     acts.push({label:"⚒️ Ready villager", cls:"go", fn:()=>{ G.ready=true; flash("Villager ready — pick a target."); refreshPanel(); }});
-  }
   if (ent && ent.type==="cow") acts.push({label:"🐄 Tend (milk)", cls:"go", fn:()=>cmd("tend",ent)});
   if (ent && ent.type==="trader") acts.push({label:"🛒 Trade", cls:"go", fn:()=>cmd("trade",ent)});
   if (ent && ent.type==="marauder") acts.push({label:"⚔️ Battle", cls:"go", fn:()=>cmd("battle",ent)});
 
   if (!ent || ent.type==="villager"){
-    acts.push({label:"▲ Raise", cls:"up", fn:()=>terraform(h.q,h.r,1)});
-    acts.push({label:"▼ Lower", cls:"down", fn:()=>terraform(h.q,h.r,-1)});
+    acts.push({label:"▲ Raise", cls:"up", dis:t.elev>=E_MAX, fn:()=>terraform(h.q,h.r,1)});
+    acts.push({label:"▼ Lower", cls:"down", dis:t.elev<=E_MIN, fn:()=>terraform(h.q,h.r,-1)});
   }
-  if (t.improve && t.improve.kind==="forest" && !ent){
+  if (t.improve && t.improve.kind==="forest" && !ent)
     acts.push({label:"🪵 Chop wood", fn:()=>assignTask("chop",{q:h.q,r:h.r})});
-  }
-  if (t.height===3 && !t.improve && !ent){
+  if (t.improve && t.improve.kind==="quarry")
+    acts.push({label:"⛏️ Mine (gold)", fn:()=>assignTask("mine",{q:h.q,r:h.r})});
+  if (t.elev===0 && !t.improve && !t.wet && !ent)
     acts.push({label:"🌾 Build farm", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
-  }
-  if ((t.height===3||t.height===4) && !t.improve && !ent && G.res.wood>=4 && G.res.gold>=2){
+  if (t.elev>=0 && t.elev<=2 && !t.improve && !t.wet && !ent && G.res.wood>=4 && G.res.gold>=2)
     acts.push({label:"🏠 Build house (4🪵 2🪙)", fn:()=>{
       if (G.res.wood<4||G.res.gold<2){flash("Need 4 wood, 2 gold.");return;}
       G.res.wood-=4; G.res.gold-=2; assignTask("build",{q:h.q,r:h.r});
     }});
-  }
   renderActions(acts);
 }
 function entLabel(t){
@@ -570,17 +596,12 @@ function renderActions(acts){
   for (const a of acts){
     const b=document.createElement("button");
     b.className="act"+(a.cls?" "+a.cls:"");
-    b.textContent=a.label;
+    b.textContent=a.label; b.disabled=!!a.dis;
     b.onclick=(e)=>{ e.stopPropagation(); a.fn(); };
     actEl.appendChild(b);
   }
 }
-function cmd(kind, ent){
-  if (assignTask(kind, ent)){
-    flash("Villager dispatched.");
-    G.ready=false;
-  }
-}
+function cmd(kind, ent){ if (assignTask(kind, ent)){ flash("Villager dispatched."); G.ready=false; } }
 
 // ---------- input: tap vs swipe ----------
 const cv = document.getElementById("cv");
@@ -593,46 +614,57 @@ function evToHex(clientX, clientY){
   const h = pixelToHex(px, py);
   return G.map.has(key(h.q,h.r)) ? h : null;
 }
-function onDown(x,y){ down = { x, y, t:Date.now(), hex: evToHex(x,y) }; }
+function onDown(x,y){ down = { x, y, hex: evToHex(x,y) }; }
 function onUp(x,y){
   if (!down) return;
   const dx = x-down.x, dy = y-down.y;
   const dist = Math.hypot(dx,dy);
-  const h = down.hex;
-  down = null;
+  const h = down.hex; down = null;
   if (!h){ G.selHex=null; refreshPanel(); return; }
-  if (dist < 14){
-    handleTap(h);
-  } else if (Math.abs(dy) > 22 && Math.abs(dy) > Math.abs(dx)*1.1){
-    // vertical swipe = terraform
-    G.selHex = h;
-    terraform(h.q, h.r, dy<0 ? 1 : -1);
-    refreshPanel();
-  } else {
-    G.selHex = h; refreshPanel();
-  }
+  if (dist < 14){ handleTap(h); }
+  else if (Math.abs(dy) > 22 && Math.abs(dy) > Math.abs(dx)*1.1){
+    G.selHex = h; terraform(h.q, h.r, dy<0 ? 1 : -1); refreshPanel();
+  } else { G.selHex = h; refreshPanel(); }
 }
 function handleTap(h){
   G.selHex = h;
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
+  const t = G.map.get(key(h.q,h.r));
   if (ent && ent.type==="house"){ G.ready=true; flash("Villager ready — tap a target."); }
   else if (G.ready && ent && ent.type==="cow"){ cmd("tend",ent); }
   else if (G.ready && ent && ent.type==="trader"){ cmd("trade",ent); }
   else if (G.ready && ent && ent.type==="marauder"){ cmd("battle",ent); }
   else if (G.ready){
-    // tapped a plain hex while ready: do a sensible default
-    const t = G.map.get(key(h.q,h.r));
     if (t.improve&&t.improve.kind==="forest"){ assignTask("chop",h); G.ready=false; }
-    else if (t.height===3&&!t.improve){ assignTask("farm",h); G.ready=false; }
+    else if (t.improve&&t.improve.kind==="quarry"){ assignTask("mine",h); G.ready=false; }
+    else if (t.elev===0&&!t.improve&&!t.wet){ assignTask("farm",h); G.ready=false; }
     else flash("Pick an action below for this hex.");
   }
   refreshPanel();
 }
-// pointer events (covers touch + mouse)
-cv.addEventListener("pointerdown",e=>{ onDown(e.clientX,e.clientY); });
-cv.addEventListener("pointerup",e=>{ onUp(e.clientX,e.clientY); });
+cv.addEventListener("pointerdown",e=>onDown(e.clientX,e.clientY));
+cv.addEventListener("pointerup",e=>onUp(e.clientX,e.clientY));
 cv.addEventListener("pointercancel",()=>{ down=null; });
 cv.addEventListener("contextmenu",e=>e.preventDefault());
+
+// ---------- colour helpers ----------
+function mix(c, amt){ // amt>0 lighten toward white, <0 darken toward black
+  if (amt>=0) return [c[0]+(255-c[0])*amt, c[1]+(255-c[1])*amt, c[2]+(255-c[2])*amt];
+  const k=1+amt; return [c[0]*k, c[1]*k, c[2]*k];
+}
+const rgb = c=>`rgb(${c[0]|0},${c[1]|0},${c[2]|0})`;
+
+// precompute hex corner unit vectors + per-edge lighting (light from upper-left)
+const CORNER = [];
+for (let i=0;i<6;i++){ const a=Math.PI/180*(60*i+30); CORNER.push([Math.cos(a),Math.sin(a)]); }
+const LIGHT = (()=>{ const v=[-0.45,-1]; const m=Math.hypot(v[0],v[1]); return [v[0]/m,v[1]/m]; })();
+const EDGE = [];
+for (let i=0;i<6;i++){
+  const a=CORNER[i], b=CORNER[(i+1)%6];
+  let nx=(a[0]+b[0])/2, ny=(a[1]+b[1])/2; const m=Math.hypot(nx,ny)||1; nx/=m; ny/=m;
+  const lit = (nx*LIGHT[0]+ny*LIGHT[1]);          // -1 (shadow) .. 1 (lit)
+  EDGE.push({ down: ny>0.1, lit });
+}
 
 // ---------- rendering ----------
 const ctx = cv.getContext("2d");
@@ -643,17 +675,15 @@ function resize(){
   const w = stage.clientWidth, hgt = stage.clientHeight;
   cv.width = w*DPR; cv.height = hgt*DPR;
   ctx.setTransform(DPR,0,0,DPR,0,0);
-  // fit grid: compute extent
   let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
   for (const t of G.map.values()){
     const p = hexToPixel(t.q,t.r);
     minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
     minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
   }
-  const gw = (maxX-minX)+HEX*2, gh=(maxY-minY)+HEX*2+ELEV*5;
+  const gw=(maxX-minX)+HEX*2, gh=(maxY-minY)+HEX*2+ELEV*E_MAX+HEX;
   const scale = Math.min(w/gw, hgt/gh, 1.3);
-  HEX = HEX*scale; // rescale base
-  // recompute extent after scale by recomputing center
+  HEX = HEX*scale;
   minX=1e9;maxX=-1e9;minY=1e9;maxY=-1e9;
   for (const t of G.map.values()){
     const p = hexToPixel(t.q,t.r);
@@ -661,68 +691,83 @@ function resize(){
     minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
   }
   cam.x = w/2 - (minX+maxX)/2;
-  cam.y = hgt/2 - (minY+maxY)/2;
+  cam.y = hgt/2 - (minY+maxY)/2 + ELEV*E_MAX/2;  // bias so tall hills aren't clipped at top
 }
 
-function hexCorners(cx,cy){
-  const pts=[];
-  for (let i=0;i<6;i++){
-    const a = Math.PI/180*(60*i+30);
-    pts.push([cx+HEX*Math.cos(a), cy+HEX*Math.sin(a)]);
-  }
-  return pts;
+function corners(cx,cy){
+  const p=[];
+  for (let i=0;i<6;i++) p.push([cx+HEX*CORNER[i][0], cy+HEX*CORNER[i][1]]);
+  return p;
 }
 function poly(pts){
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0],pts[0][1]);
+  ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
   for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
   ctx.closePath();
 }
 
+function tileTop(t){
+  if (deepWater(t))    return mix(W_DEEP, -0.04);
+  if (shallowWater(t)) return mix(W_SHALL, 0.04);
+  if (quarry(t))       return mix(ROCK, -0.12);
+  if (mountain(t))     return mix(MOUNT, 0.10);
+  return mix(GRASS, t.elev*0.07);                 // hills brighter, dips darker — lighting, not colour
+}
+
 function draw(){
   ctx.clearRect(0,0,cv.width,cv.height);
-  ctx.fillStyle = "#0e131b";
-  ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.fillStyle = "#0e131b"; ctx.fillRect(0,0,cv.width,cv.height);
 
-  // sort by r then q for painter's order (back to front)
   const tiles = [...G.map.values()].sort((a,b)=> (a.r-b.r) || (a.q-b.q));
   for (const t of tiles){
     const p = hexToPixel(t.q,t.r);
-    const cx = p.x+cam.x, baseY=p.y+cam.y;
-    const lift = t.height*ELEV;
+    const cx = p.x+cam.x, baseY = p.y+cam.y;
+    const lift = t.elev>0 ? t.elev*ELEV : 0;       // only hills/mountains rise; dips stay flat (shaded)
     const topY = baseY - lift;
-    const topPts = hexCorners(cx, topY);
-    // side walls (front three edges)
+    const top = corners(cx, topY);
+    const top0 = tileTop(t);
+
+    // raised: shaded side walls (the "mass" of hills) — strong highlight/shadow identity
     if (lift>0){
-      ctx.fillStyle = TERR[t.height].side;
+      const sideBase = mix(top0, -0.30);
+      const base = corners(cx, baseY);
       for (let i=0;i<6;i++){
-        const a=topPts[i], b=topPts[(i+1)%6];
-        const midY=(a[1]+b[1])/2;
-        if (midY > topY+1){ // lower edge -> draw skirt
-          poly([a,b,[b[0],b[1]+lift],[a[0],a[1]+lift]]);
-          ctx.fill();
-        }
+        if (!EDGE[i].down) continue;               // draw only front-facing walls
+        const sh = -0.18 + 0.18*EDGE[i].lit;       // directional shade
+        ctx.fillStyle = rgb(mix(sideBase, sh));
+        poly([top[i], top[(i+1)%6], base[(i+1)%6], base[i]]); ctx.fill();
       }
     }
-    // top face
-    poly(topPts);
-    ctx.fillStyle = TERR[t.height].top;
-    ctx.fill();
-    ctx.lineWidth=1; ctx.strokeStyle="rgba(0,0,0,.18)"; ctx.stroke();
 
-    // improvements
-    if (t.improve){
-      if (t.improve.kind==="forest") drawTrees(cx,topY);
-      else if (t.improve.kind==="farm") drawFarm(cx,topY);
+    // top face
+    poly(top); ctx.fillStyle = rgb(top0); ctx.fill();
+
+    // recessed look for dips / quarries / deep water: inner shadow ring
+    if (t.elev<0){
+      ctx.save(); poly(top); ctx.clip();
+      ctx.lineWidth = HEX*0.42; poly(top);
+      ctx.strokeStyle = `rgba(0,0,0,${t.elev<=-2?0.34:0.20})`; ctx.stroke();
+      ctx.restore();
+    } else if (lift>0){
+      // crisp lit rim on the upper edges of raised tiles
+      for (let i=0;i<6;i++){
+        if (EDGE[i].down) continue;
+        ctx.beginPath(); ctx.moveTo(top[i][0],top[i][1]); ctx.lineTo(top[(i+1)%6][0],top[(i+1)%6][1]);
+        ctx.strokeStyle="rgba(255,255,255,0.18)"; ctx.lineWidth=1.5; ctx.stroke();
+      }
     }
-    // selection highlight
+
+    poly(top); ctx.lineWidth=1; ctx.strokeStyle="rgba(0,0,0,.22)"; ctx.stroke();
+
+    if (t.improve){
+      if (t.improve.kind==="forest") drawTrees(cx, topY);
+      else if (t.improve.kind==="farm") drawFarm(cx, topY);
+      else if (t.improve.kind==="quarry") drawQuarry(cx, topY);
+    }
     if (G.selHex && G.selHex.q===t.q && G.selHex.r===t.r){
-      poly(topPts);
-      ctx.lineWidth=3; ctx.strokeStyle="#ffe066"; ctx.stroke();
+      poly(top); ctx.lineWidth=3; ctx.strokeStyle="#ffe066"; ctx.stroke();
     }
   }
 
-  // entities (draw after tiles, sorted same way by their tile)
   const ents = [...G.ents].sort((a,b)=>{
     const ta=G.map.get(key(a.q,a.r)), tb=G.map.get(key(b.q,b.r));
     return (ta.r-tb.r)||(ta.q-tb.q);
@@ -730,7 +775,8 @@ function draw(){
   for (const e of ents){
     const t = G.map.get(key(e.q,e.r)); if(!t) continue;
     const p = hexToPixel(e.q,e.r);
-    const cx=p.x+cam.x, cy=p.y+cam.y - t.height*ELEV - HEX*0.18;
+    const lift = t.elev>0 ? t.elev*ELEV : 0;
+    const cx=p.x+cam.x, cy=p.y+cam.y - lift - HEX*0.18;
     drawEntity(e, cx, cy);
   }
   requestAnimationFrame(draw);
@@ -742,7 +788,6 @@ function drawEntity(e,cx,cy){
     case "house":
       ctx.fillStyle="#8a5a32"; ctx.strokeStyle="#3a2412"; ctx.lineWidth=1.5;
       ctx.fillRect(cx-s*0.7, cy-s*0.55, s*1.4, s*1.1); ctx.strokeRect(cx-s*0.7, cy-s*0.55, s*1.4, s*1.1);
-      // roof
       ctx.fillStyle="#b5713f"; ctx.beginPath();
       ctx.moveTo(cx-s*0.85,cy-s*0.55); ctx.lineTo(cx,cy-s*1.15); ctx.lineTo(cx+s*0.85,cy-s*0.55); ctx.closePath(); ctx.fill();
       break;
@@ -760,15 +805,13 @@ function drawEntity(e,cx,cy){
       ctx.fillStyle="#fff"; ctx.font=`${s*0.7}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle";
       ctx.fillText("$",cx,cy+1);
       break;
-    case "marauder": {
+    case "marauder":
       ctx.fillStyle="#e3604f"; ctx.strokeStyle="#5c1f17"; ctx.lineWidth=1.2;
       ctx.beginPath(); ctx.moveTo(cx,cy-s*0.5); ctx.lineTo(cx+s*0.5,cy+s*0.4); ctx.lineTo(cx-s*0.5,cy+s*0.4); ctx.closePath();
       ctx.fill(); ctx.stroke();
-      // hp pips
       ctx.fillStyle="#fff"; ctx.font=`${s*0.5}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle";
       ctx.fillText(e.hp, cx, cy+s*0.12);
       break;
-    }
   }
 }
 function drawTrees(cx,cy){
@@ -781,8 +824,12 @@ function drawTrees(cx,cy){
 }
 function drawFarm(cx,cy){
   ctx.strokeStyle="#caa64a"; ctx.lineWidth=2;
-  for (let i=-1;i<=1;i++){
-    ctx.beginPath(); ctx.moveTo(cx-HEX*0.5, cy+i*HEX*0.22); ctx.lineTo(cx+HEX*0.5, cy+i*HEX*0.22); ctx.stroke();
+  for (let i=-1;i<=1;i++){ ctx.beginPath(); ctx.moveTo(cx-HEX*0.5, cy+i*HEX*0.22); ctx.lineTo(cx+HEX*0.5, cy+i*HEX*0.22); ctx.stroke(); }
+}
+function drawQuarry(cx,cy){
+  ctx.fillStyle="#b9b2a6";
+  for (const off of [[-0.18,0.05],[0.2,-0.05],[0.02,0.2]]){
+    ctx.beginPath(); ctx.arc(cx+off[0]*HEX, cy+off[1]*HEX, HEX*0.12, 0, 7); ctx.fill();
   }
 }
 
@@ -791,9 +838,7 @@ function restart(){
   G.res={food:8,milk:0,wood:6,gold:5}; G.pop=0; G.popCap=3;
   G.day=0; G.tick=0; G.selHex=null; G.ready=false; G.nextEvent=14; G.over=false;
   logEl.innerHTML="";
-  setupStart();
-  resize();
-  renderStats(); refreshPanel();
+  setupStart(); resize(); renderStats(); refreshPanel();
 }
 
 setupStart();
