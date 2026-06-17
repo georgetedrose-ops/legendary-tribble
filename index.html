@@ -213,6 +213,7 @@ const G = {
   selHex: null,
   placing: null,     // 'watchtower' while siting a building
   paused: false,     // true while an event modal is open
+  alarm: false,      // bell raised -> villagers muster at the warehouse
   shots: [],         // transient watchtower arrow effects
   nextEvent: 14,
   over: false,
@@ -276,6 +277,7 @@ function removeEnt(id){ const i=G.ents.findIndex(e=>e.id===id); if(i>=0) G.ents.
 function setupStart(){
   genMap();
   G.ents.length = 0;
+  G.over=false; G.alarm=false; G.placing=null; G.paused=false; G.shots=[];
   let home = null;
   for (let d=0; d<=RADIUS && !home; d++){
     for (const t of G.map.values()){
@@ -283,7 +285,7 @@ function setupStart(){
     }
   }
   if (!home){ home = G.map.get(key(0,0)); home.elev = 0; home.isSea=false; computeWater(); }
-  addEnt({ type:"warehouse", q:home.q, r:home.r });   // central HQ — all resources deposit here
+  addEnt({ type:"warehouse", q:home.q, r:home.r, hp:14, maxhp:14 });   // central HQ — all resources deposit here
   placeHouse(home); placeHouse(home);                 // a home for each starting villager
   spawnVillager(home.q, home.r);
   spawnVillager(home.q, home.r);
@@ -303,7 +305,7 @@ function freeTileNear(near, avoidType){
 function placeHouse(near){
   const t = freeTileNear(near||warehouse()||{q:0,r:0});
   if (!t) return null;
-  return addEnt({ type:"house", q:t.q, r:t.r, homeOf:null });
+  return addEnt({ type:"house", q:t.q, r:t.r, homeOf:null, hp:4, maxhp:4 });
 }
 const houseCount = ()=>G.ents.filter(e=>e.type==="house").length;
 const freeHouse  = ()=>G.ents.find(e=>e.type==="house" && !e.homeOf);
@@ -314,7 +316,7 @@ function spawnVillager(q,r){
     const t = G.map.get(key(q+dq,r+dr));
     if (t && isWalkable(t) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
   }
-  const v = addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0, homeId:null });
+  const v = addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0, homeId:null, hp:3, maxhp:3 });
   const h = freeHouse();
   if (h){ h.homeOf = v.id; v.homeId = h.id; }
   return v;
@@ -390,7 +392,8 @@ function depotFor(from){ return warehouse() || nearestHouse(from); }
 function nearestIdleVillager(q,r){
   let best=null, bd=1e9;
   for (const e of G.ents){
-    if (e.type!=="villager" || e.task) continue;
+    // idle, or just mustering at the alarm (so defenders can still be sent out)
+    if (e.type!=="villager" || (e.task && e.task.kind!=="muster")) continue;
     const d = hexDist(e,{q,r});
     if (d<bd){ bd=d; best=e; }
   }
@@ -406,8 +409,9 @@ const GATHER = {
 function assignTask(kind, target){
   const v = nearestIdleVillager(target.q, target.r);
   if (!v){ flash("All villagers are busy — recall one first."); return false; }
+  if (v.carry) dropCarry(v, false);          // drop any held load on the ground
   v.task = { kind, q:target.q, r:target.r, targetId: target.id || null, phase:"go" };
-  v.work = 0; v.carry = null; v.stationed = false;
+  v.work = 0; v.stationed = false; v.suspended = null; v.dropId = null;
   return true;
 }
 function assignNearest(kind, target){
@@ -435,7 +439,7 @@ function spawnEdgeHex(walkableOnly){
 }
 function spawnCows(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t) addEnt({type:"cow", q:t.q, r:t.r, timer:45+rnd(30)}); } }
 function spawnTrader(){ const t=spawnEdgeHex(true); if(t) addEnt({type:"trader", q:t.q, r:t.r, timer:38+rnd(20)}); }
-function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0}); } } }
+function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0, acd:0, spawn:{q:t.q,r:t.r}, thief:Math.random()<0.4, loot:null}); } } }
 function loseVillager(reason){
   const vs = G.ents.filter(e=>e.type==="villager");
   if (vs.length<=1){ return false; }
@@ -457,7 +461,8 @@ function logicTick(){
 
   for (const v of G.ents){
     if (v.type!=="villager" || !v.task) continue;
-    if (v.task.kind==="return") handleReturn(v);
+    if (v.task.kind==="muster") handleMuster(v);
+    else if (v.task.kind==="recover") handleRecover(v);
     else if (v.task.kind==="buildtower" || v.task.kind==="man") handleTower(v);
     else if (GATHER[v.task.kind]) handleGather(v);
     else handleInstant(v);
@@ -479,17 +484,8 @@ function logicTick(){
     } else if (e.type==="trader"){
       if (--e.timer<=0){ removeEnt(e.id); log("🛒 The traders moved on."); }
     } else if (e.type==="marauder"){
-      if (hq){
-        // cost-aware path: marauders flow around hills and impassable rivers
-        stepToward(e, {q:hq.q,r:hq.r}, true, 0.34);
-        if (hexDist(e,hq)<=1){
-          G.res.food = Math.max(0, G.res.food-3);
-          G.res.gold = Math.max(0, G.res.gold-2);
-          removeEnt(e.id);
-          log("💥 Marauders raided the warehouse! Lost food and gold.");
-          flash("💥 Your warehouse was raided!");
-        }
-      }
+      marauderAct(e);
+      if (G.over) break;
     }
   }
 
@@ -504,7 +500,7 @@ function logicTick(){
     if (tgt){
       tgt.hp--; tw.cd=2;
       G.shots.push({ a:{q:tw.q,r:tw.r}, b:{q:tgt.q,r:tgt.r}, life:8 });
-      if (tgt.hp<=0){ removeEnt(tgt.id); G.res.gold+=2; log("🏹 The watchtower felled a marauder! +2 gold."); }
+      if (tgt.hp<=0){ dropLoot(tgt); removeEnt(tgt.id); G.res.gold+=2; log("🏹 The watchtower felled a marauder! +2 gold."); }
     }
   }
 
@@ -515,6 +511,14 @@ function logicTick(){
     if (Math.random()<0.15) loseVillager("☠️ A villager starved. Assign a farmer!");
   }
   G.res.food = food;
+
+  // wounded villagers recover slowly when not out working
+  if (G.tick % 5 === 0){
+    const danger = e => G.ents.some(m=>m.type==="marauder" && hexDist(m,e)<=1);
+    for (const v of G.ents){
+      if (v.type==="villager" && v.hp<v.maxhp && (!v.task || v.task.kind==="muster") && !danger(v)) v.hp++;
+    }
+  }
 
   if (G.res.food >= 12 && G.pop < houseCount() && freeHouse()){
     G.res.food -= 10; G.pop++;
@@ -599,22 +603,158 @@ function handleTower(v){
   }
 }
 
-// alarm: every villager drops what they're doing and returns to the warehouse
-function handleReturn(v){
+// ---------- the alarm bell (toggle) ----------
+// drop a carried load on the ground; ownerRef lets the dropper remember it
+function dropCarry(v, ownerRef){
+  if (!v.carry) return null;
+  const it = addEnt({ type:"item", res:v.carry.res, amt:v.carry.amt, q:v.q, r:v.r });
+  if (ownerRef) v.dropId = it.id;
+  v.carry = null;
+  return it;
+}
+function setAlarm(on){
+  const wh = warehouse(); if (!wh) return;
+  if (on === G.alarm) return;
+  G.alarm = on;
+  if (on){
+    flash("🔔 Alarm! Villagers drop their loads and muster.");
+    log("🔔 The alarm bell rings — villagers rush home, dropping what they carry.");
+    for (const v of G.ents){
+      if (v.type!=="villager") continue;
+      if (v.carry) dropCarry(v, true);
+      if (v.task && v.task.kind!=="muster") v.suspended = v.task;   // remember the job
+      v.task = { kind:"muster" }; v.work=0; v.stationed=false;
+    }
+  } else {
+    flash("✅ All clear — villagers return to work.");
+    log("✅ The all-clear sounds — villagers resume their work and fetch dropped loads.");
+    for (const v of G.ents){
+      if (v.type==="villager" && v.task && v.task.kind==="muster") resumeVillager(v);
+    }
+  }
+  refreshPanel();
+}
+function resumeVillager(v){
+  if (v.dropId && G.ents.some(e=>e.id===v.dropId)){ v.task={kind:"recover", targetId:v.dropId}; v.work=0; return; }
+  v.dropId = null;
+  if (v.suspended){ const s=v.suspended; v.suspended=null; if (s.phase) s.phase="go"; v.task=s; v.work=0; return; }
+  v.task = null;
+}
+function ringBell(){ setAlarm(true); }
+function toggleAlarm(){ setAlarm(!G.alarm); }
+
+// while the alarm sounds, hold position by the warehouse
+function handleMuster(v){
+  const wh = warehouse() || depotFor(v);
+  if (!wh){ v.task=null; return; }
+  stepToward(v, {q:wh.q,r:wh.r}, true, 1);
+}
+// fetch a previously dropped load, carry it home, then resume the old job
+function handleRecover(v){
+  if (!v.carry){
+    const item = G.ents.find(e=>e.id===v.task.targetId);
+    if (!item){ v.dropId=null; finishRecover(v); return; }   // it was stolen/gone
+    const arr = stepToward(v, {q:item.q,r:item.r}, false, 1);
+    if (arr===null){ v.dropId=null; finishRecover(v); return; }
+    if (arr){ v.carry={res:item.res, amt:item.amt}; removeEnt(item.id); v.dropId=null; }
+    return;
+  }
   const depot = depotFor(v);
-  if (!depot){ v.task=null; return; }
   const arr = stepToward(v, {q:depot.q,r:depot.r}, true, 1);
-  if (arr===null){ v.task=null; return; }
-  if (arr){
-    if (v.carry){ G.res[v.carry.res] += v.carry.amt; v.carry=null; }
-    v.task=null;
+  if (arr===null){ finishRecover(v); return; }
+  if (arr){ G.res[v.carry.res]+=v.carry.amt; log("📦 Recovered "+v.carry.amt+" "+v.carry.res+"."); v.carry=null; finishRecover(v); }
+}
+function finishRecover(v){
+  if (v.suspended){ const s=v.suspended; v.suspended=null; if (s.phase) s.phase="go"; v.task=s; v.work=0; }
+  else v.task=null;
+}
+
+// ---------- combat resolution ----------
+function killVillager(v){
+  if (v.homeId){ const h=G.ents.find(e=>e.id===v.homeId); if(h) h.homeOf=null; }
+  removeEnt(v.id); G.pop--;
+  log("☠️ A villager was slain by raiders!");
+  if (G.pop<=0){ G.over=true; flash("Your last villager has fallen — game over."); }
+}
+function destroyBuilding(b){
+  if (b.type==="warehouse"){ removeEnt(b.id); G.over=true; log("💀 The warehouse has been destroyed!"); flash("Your warehouse is destroyed — game over."); return; }
+  if (b.type==="house"){
+    if (b.homeOf){ const o=G.ents.find(e=>e.id===b.homeOf); if(o) o.homeId=null; }
+    removeEnt(b.id); log("🏚️ Raiders razed a house!");
+  } else if (b.type==="watchtower"){
+    if (b.crew){ const c=G.ents.find(e=>e.id===b.crew); if(c){ c.task=null; c.stationed=false; } }
+    removeEnt(b.id); log("🗼 A watchtower was torn down!");
   }
 }
-function ringBell(){
-  const wh = warehouse(); if (!wh) return;
-  flash("🔔 Alarm! Villagers returning to the village.");
-  log("🔔 The alarm bell rings — every villager rushes back to the warehouse.");
-  for (const v of G.ents) if (v.type==="villager"){ v.task={kind:"return"}; v.work=0; v.stationed=false; }
+function dropLoot(m){
+  if (!m.loot) return;
+  addEnt({ type:"item", res:m.loot.res, amt:m.loot.amt, q:m.q, r:m.r });
+  log("💰 The slain raider dropped "+m.loot.amt+" "+m.loot.res+" — recover it!");
+  m.loot = null;
+}
+function grabFromWarehouse(){
+  const opts = ["food","wood","stone","gold","milk","leather"].filter(k=>G.res[k]>=2);
+  if (!opts.length) return null;
+  const res = pick(opts), amt = Math.min(Math.floor(G.res[res]), 3+rnd(3));
+  G.res[res] -= amt;
+  return { res, amt };
+}
+function nearestEntOfType(from, type, within){
+  let best=null, bd=within??1e9;
+  for (const e of G.ents){ if (e.type!==type) continue; const d=hexDist(e,from); if (d<=bd){ bd=d; best=e; } }
+  return best;
+}
+function nearestOuterBuilding(from){
+  let best=null, bd=1e9;
+  for (const e of G.ents){
+    if (e.type!=="house" && e.type!=="watchtower") continue;
+    const d=hexDist(e,from); if (d<bd){ bd=d; best=e; }
+  }
+  return best;
+}
+// attackers: kill villagers, raze outlying buildings, then the warehouse; some steal & flee
+function marauderAct(e){
+  // carrying loot -> flee back the way they came, off the map
+  if (e.loot){
+    const goal = e.spawn || {q:e.q,r:e.r};
+    const arr = stepToward(e, goal, false, 0.45);
+    if (arr===true || hexDist(e,{q:0,r:0})>=RADIUS){
+      log("🏴‍☠️ Raiders escaped with "+e.loot.amt+" "+e.loot.res+"!");
+      flash("Raiders made off with your "+e.loot.res+"!");
+      removeEnt(e.id);
+    }
+    return;
+  }
+  // thieves snatch dropped loads lying in the open
+  if (e.thief){
+    const item = nearestEntOfType(e, "item");
+    if (item){
+      const arr = stepToward(e, {q:item.q,r:item.r}, false, 0.45);
+      if (arr===true){ e.loot={res:item.res, amt:item.amt}; removeEnt(item.id); log("🏴‍☠️ A marauder snatched a dropped load!"); }
+      return;
+    }
+  }
+  // target priority: a nearby villager, else the nearest outlying building, else the warehouse
+  const tgt = nearestEntOfType(e, "villager", 3) || nearestOuterBuilding(e) || warehouse();
+  if (!tgt) return;
+  if (hexDist(e,tgt)<=1){
+    e.acd = (e.acd||0) - 1;
+    if (e.acd>0) return;
+    e.acd = 2;
+    if (tgt.type==="villager"){
+      tgt.hp = (tgt.hp||1) - 1;
+      if (tgt.hp<=0) killVillager(tgt);
+    } else {
+      if (tgt.type==="warehouse" && e.thief && Math.random()<0.5){
+        const loot = grabFromWarehouse();
+        if (loot){ e.loot=loot; log("🏴‍☠️ Raiders grabbed "+loot.amt+" "+loot.res+" from the warehouse!"); return; }
+      }
+      tgt.hp = (tgt.hp||1) - 1;
+      if (tgt.hp<=0) destroyBuilding(tgt);
+    }
+  } else {
+    stepToward(e, {q:tgt.q,r:tgt.r}, true, 0.34);
+  }
 }
 
 // ---------- watchtower placement & crewing ----------
@@ -625,7 +765,7 @@ function tryPlaceTower(h){
   if (!t || !isWalkable(t) || t.improve || occupied){ flash("Pick an empty, walkable tile."); return; }
   if (G.res.wood<TOWER_COST.wood || G.res.stone<TOWER_COST.stone){ flash("Need 6 wood and 4 stone."); G.placing=null; return; }
   G.res.wood-=TOWER_COST.wood; G.res.stone-=TOWER_COST.stone;
-  const tw = addEnt({ type:"watchtower", q:h.q, r:h.r, built:false, crew:null, cd:0, range:3 });
+  const tw = addEnt({ type:"watchtower", q:h.q, r:h.r, built:false, crew:null, cd:0, range:3, hp:6, maxhp:6 });
   G.placing=null;
   assignNearest("buildtower", tw);
   log("🏗️ A watchtower is being raised here.");
@@ -677,7 +817,7 @@ function doWork(v, tk, tq, tr){
       break;
     case "build":
       if (v.work>=4){
-        addEnt({type:"house", q:tq, r:tr, homeOf:null});
+        addEnt({type:"house", q:tq, r:tr, homeOf:null, hp:4, maxhp:4});
         v.task=null;
         log("🏠 A new house is built — room for another villager.");
         flash("New house built!");
@@ -706,7 +846,7 @@ function doWork(v, tk, tq, tr){
       if (v.work % 2 === 0){
         m.hp--;
         if (m.hp<=0){
-          removeEnt(m.id); v.task=null;
+          dropLoot(m); removeEnt(m.id); v.task=null;
           const reward = 2 + rnd(3); G.res.gold += reward;
           log("🛡️ Marauder defeated! Looted "+reward+" gold.");
           flash("Marauder defeated! +"+reward+" gold");
@@ -876,10 +1016,15 @@ function refreshPanel(){
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
 
   if (ent && ent.type==="warehouse"){
-    selEl.innerHTML = "<b>🏛️ Warehouse (HQ)</b><br>"
+    selEl.innerHTML = "<b>🏛️ Warehouse (HQ)</b>"+(ent.hp<ent.maxhp?` · ❤️ ${ent.hp}/${ent.maxhp}`:"")+"<br>"
       + `🌾 ${Math.floor(G.res.food)} food · 🥛 ${Math.floor(G.res.milk)} milk · 🪵 ${Math.floor(G.res.wood)} wood · 🪨 ${Math.floor(G.res.stone)} stone · 🟫 ${Math.floor(G.res.leather)} hide · 🪙 ${Math.floor(G.res.gold)} gold · 🧑 ${G.pop}/${houseCount()}`
-      + "<br><span style='font-size:11px'>Hold the warehouse to ring the alarm bell.</span>";
-    acts.push({label:"🔔 Sound alarm", cls:"down", fn:()=>ringBell()});
+      + "<br><span style='font-size:11px'>"+(G.alarm?"Alarm raised — hold or tap to stand down.":"Hold the warehouse to ring the alarm bell.")+"</span>";
+    acts.push({label: G.alarm?"✅ All clear":"🔔 Sound alarm", cls: G.alarm?"go":"down", fn:()=>toggleAlarm()});
+    renderActions(acts); return;
+  }
+  if (ent && ent.type==="item"){
+    selEl.innerHTML = `<b>📦 Dropped ${ent.amt} ${ent.res}</b> — send a villager to carry it home.`;
+    acts.push({label:"📦 Recover load", cls:"go", fn:()=>{ if(assignTask("recover",ent)) flash("Fetching the dropped load."); }});
     renderActions(acts); return;
   }
   if (ent && ent.type==="house"){
@@ -935,11 +1080,12 @@ function refreshPanel(){
   renderActions(acts);
 }
 function entLabel(t){
-  return { warehouse:"🏛️ warehouse", house:"🏠 home", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder", watchtower:"🗼 watchtower" }[t]||t;
+  return { warehouse:"🏛️ warehouse", house:"🏠 home", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder", watchtower:"🗼 watchtower", item:"📦 dropped load" }[t]||t;
 }
 function villagerStatus(v){
   if (!v.task) return "idle";
-  if (v.task.kind==="return") return "returning to the village";
+  if (v.task.kind==="muster") return "mustering at the alarm";
+  if (v.task.kind==="recover") return v.carry ? "carrying a dropped load home" : "fetching a dropped load";
   if (v.task.kind==="man") return v.stationed ? "manning the watchtower" : "heading to the tower";
   if (v.task.kind==="buildtower") return "building the watchtower";
   const g = GATHER[v.task.kind];
@@ -979,7 +1125,7 @@ function onDown(x,y){
   down = { x, y, hex: evToHex(x,y), held:false };
   clearHold();
   const onWh = down.hex && G.ents.some(e=>e.type==="warehouse"&&e.q===down.hex.q&&e.r===down.hex.r);
-  if (onWh) holdT = setTimeout(()=>{ if(down){ down.held=true; ringBell(); } }, 550);  // hold to ring bell
+  if (onWh) holdT = setTimeout(()=>{ if(down){ down.held=true; toggleAlarm(); } }, 550);  // hold to ring / silence bell
 }
 function onMove(x,y){ if (down && Math.hypot(x-down.x, y-down.y) > 12) clearHold(); }
 function onUp(x,y){
@@ -1005,6 +1151,7 @@ function handleTap(h){
   else if (ent && ent.type==="trader") assignNearest("trade", ent);
   else if (ent && ent.type==="marauder") assignNearest("battle", ent);
   else if (ent && ent.type==="watchtower") assignTower(ent);
+  else if (ent && ent.type==="item"){ if(assignTask("recover",ent)) flash("Fetching the dropped load."); }
   else if (!ent && t.improve && t.improve.kind==="forest") assignNearest("chop", h);
   else if (!ent && t.improve && t.improve.kind==="quarry") assignNearest("mine", h);
   else if (!ent && t.improve && t.improve.kind==="farm") assignNearest("farm", h);
@@ -1157,9 +1304,20 @@ function draw(){
       ctx.strokeStyle="#ffe066"; ctx.lineWidth=2.5; ctx.stroke();
     }
     drawEntity(e, cx, cy);
+    // health bar for damaged things and all marauders
+    if (e.maxhp && (e.hp<e.maxhp || e.type==="marauder")){
+      const top = e.type==="watchtower" ? cy-HEX*0.95 : e.type==="warehouse" ? cy-HEX*1.0 : cy-HEX*0.55;
+      drawHpBar(cx, top, Math.max(0,e.hp)/e.maxhp, e.type==="marauder"?"#e3604f":"#6ab150");
+    }
   }
   requestAnimationFrame(draw);
 }
+function drawHpBar(cx, cy, frac, col){
+  const w=HEX*0.7, hh=3;
+  ctx.fillStyle="rgba(0,0,0,.55)"; ctx.fillRect(cx-w/2-1, cy-1, w+2, hh+2);
+  ctx.fillStyle=col; ctx.fillRect(cx-w/2, cy, w*frac, hh);
+}
+const RESCOL = { wood:"#8a5a32", gold:"#f2c94c", milk:"#eaf2fb", food:"#6ab150", stone:"#b9b2a6", leather:"#9c6b3f" };
 
 // fading watchtower arrows
 function drawShots(){
@@ -1208,6 +1366,13 @@ function drawPaths(){
 function drawEntity(e,cx,cy){
   const s = HEX*0.42;
   switch(e.type){
+    case "item": {
+      const col = RESCOL[e.res]||"#fff";
+      ctx.fillStyle="rgba(0,0,0,.3)"; ctx.beginPath(); ctx.ellipse(cx, cy+s*0.28, s*0.4, s*0.16, 0,0,7); ctx.fill();
+      ctx.fillStyle=col; ctx.strokeStyle="#1a232e"; ctx.lineWidth=1.3;
+      ctx.beginPath(); ctx.arc(cx, cy, s*0.34, 0, 7); ctx.fill(); ctx.stroke();
+      break;
+    }
     case "watchtower": {
       const built = e.built;
       ctx.fillStyle = built ? "#8b8f98" : "#6c7077"; ctx.strokeStyle="#2c2f34"; ctx.lineWidth=1.5;
@@ -1246,8 +1411,7 @@ function drawEntity(e,cx,cy){
       ctx.fillStyle="#f4f7fb"; ctx.strokeStyle="#243140"; ctx.lineWidth=1.2;
       ctx.fillRect(cx-s*0.35,cy-s*0.35,s*0.7,s*0.7); ctx.strokeRect(cx-s*0.35,cy-s*0.35,s*0.7,s*0.7);
       if (e.carry){                                       // a little load being carried home
-        const col={wood:"#8a5a32",gold:"#f2c94c",milk:"#eaf2fb",food:"#6ab150"}[e.carry.res]||"#fff";
-        ctx.fillStyle=col; ctx.beginPath(); ctx.arc(cx, cy-s*0.62, s*0.22, 0, 7); ctx.fill();
+        ctx.fillStyle=RESCOL[e.carry.res]||"#fff"; ctx.beginPath(); ctx.arc(cx, cy-s*0.62, s*0.22, 0, 7); ctx.fill();
         ctx.strokeStyle="#243140"; ctx.lineWidth=1; ctx.stroke();
       }
       break;
@@ -1267,6 +1431,10 @@ function drawEntity(e,cx,cy){
       ctx.fill(); ctx.stroke();
       ctx.fillStyle="#fff"; ctx.font=`${s*0.5}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle";
       ctx.fillText(e.hp, cx, cy+s*0.12);
+      if (e.loot){                                        // stolen goods being carried off
+        ctx.fillStyle=RESCOL[e.loot.res]||"#fff"; ctx.beginPath(); ctx.arc(cx+s*0.4, cy-s*0.4, s*0.2, 0, 7); ctx.fill();
+        ctx.strokeStyle="#1a232e"; ctx.lineWidth=1; ctx.stroke();
+      }
       break;
   }
 }
@@ -1292,7 +1460,7 @@ function drawQuarry(cx,cy){
 // ---------- boot ----------
 function restart(){
   G.res={...START_RES}; G.pop=0;
-  G.day=0; G.tick=0; G.selHex=null; G.placing=null; G.paused=false; G.shots=[];
+  G.day=0; G.tick=0; G.selHex=null; G.placing=null; G.paused=false; G.alarm=false; G.shots=[];
   G.nextEvent=14; G.over=false;
   closeEvent();
   logEl.innerHTML="";
