@@ -156,6 +156,9 @@ const DIRS = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
 const key = (q,r)=>q+","+r;
 
 function hexToPixel(q,r){ return { x: HEX*SQ3*(q + r/2), y: HEX*1.5*r }; }
+// HEX-independent "unit" coordinates for continuous entity positions (scaled by HEX at draw time)
+function uPix(q,r){ return { x: SQ3*(q + r/2), y: 1.5*r }; }
+function uToHex(x,y){ return cubeRound((SQ3/3*x - 1/3*y), (2/3*y)); }
 function pixelToHex(px,py){
   const q = (SQ3/3*px - 1/3*py)/HEX;
   const r = (2/3*py)/HEX;
@@ -215,7 +218,7 @@ const G = {
   paused: false,     // true while an event modal is open
   alarm: false,      // bell raised -> villagers muster at the warehouse
   shots: [],         // transient watchtower arrow effects
-  nextEvent: 14, lastBadTick: -999,
+  nextEvent: 60, lastBadTick: -999,
   over: false,
 };
 let nextId = 1;
@@ -329,7 +332,7 @@ function genMap(){
 }
 
 // ---------- entities ----------
-function addEnt(e){ e.id = eid(); G.ents.push(e); return e; }
+function addEnt(e){ e.id = eid(); if(e.x===undefined){ const p=uPix(e.q,e.r); e.x=p.x; e.y=p.y; } G.ents.push(e); return e; }
 function entAt(q,r,type){ return G.ents.find(e=>e.q===q&&e.r===r&&(!type||e.type===type)); }
 function removeEnt(id){ const i=G.ents.findIndex(e=>e.id===id); if(i>=0) G.ents.splice(i,1); }
 
@@ -375,7 +378,7 @@ function spawnVillager(q,r){
     const t = G.map.get(key(q+dq,r+dr));
     if (t && isWalkable(t) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
   }
-  const v = addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0, homeId:null, hp:3, maxhp:3 });
+  const v = addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, homeId:null, hp:3, maxhp:3, baseSpeed:1.7 });
   const h = freeHouse();
   if (h){ h.homeOf = v.id; v.homeId = h.id; }
   return v;
@@ -417,22 +420,39 @@ function findPath(from, goal, goalAdjacentOk){
   return cells;
 }
 
-// move one ent toward goal using accumulated move points; caches the planned
-// path on ent.pathCells (for the on-map path line). Returns
-// true = arrived, false = still travelling, null = no path.
-function stepToward(ent, goal, adjacentOk, speed){
-  if (ent.q===goal.q && ent.r===goal.r){ ent.pathCells=null; return true; }
-  if (adjacentOk && hexDist(ent,goal)===1){ ent.pathCells=null; return true; }
+function atGoal(e, goal, adj){
+  if (e.q===goal.q && e.r===goal.r) return true;
+  return adj && hexDist(e,goal)===1;
+}
+// Request continuous movement toward a goal and report progress. The actual
+// gliding happens every frame in moveEntities(); here we just (re)plan the path
+// and check arrival. Returns true = arrived, false = travelling, null = no path.
+function stepToward(ent, goal, adjacentOk, mul){
+  if (atGoal(ent, goal, adjacentOk)){ ent.goal=null; ent.path=null; return true; }
   const path = findPath({q:ent.q,r:ent.r}, goal, adjacentOk);
-  if (!path || !path.length){ ent.pathCells=null; return null; }
-  ent.pathCells = path;
-  const step = path[0];
-  ent.mp = Math.min((ent.mp||0) + speed, 3);
-  const cost = moveCost(G.map.get(key(step.q,step.r)));
-  if (ent.mp >= cost){ ent.mp -= cost; ent.q = step.q; ent.r = step.r; }
-  if (ent.q===goal.q && ent.r===goal.r){ ent.pathCells=null; return true; }
-  if (adjacentOk && hexDist(ent,goal)===1){ ent.pathCells=null; return true; }
+  if (!path || !path.length){ ent.goal=null; ent.path=null; return null; }
+  ent.path = path;
+  ent.goal = { q:goal.q, r:goal.r, adj:!!adjacentOk, mul:mul||1 };
   return false;
+}
+// real-time movement: glide each entity along its path by speed*dt every frame
+function moveEntities(dt){
+  for (const e of G.ents){
+    if (!e.goal || !e.path || !e.path.length) continue;
+    let remaining = dt;
+    while (remaining>0 && e.path.length){
+      const wp = e.path[0], w = uPix(wp.q,wp.r);
+      const dx = w.x-e.x, dy = w.y-e.y, d = Math.hypot(dx,dy);
+      if (d < 1e-6){ e.path.shift(); continue; }
+      const tile = G.map.get(key(wp.q,wp.r));
+      const sp = (e.baseSpeed||1) * (e.goal.mul||1) / (tile?moveCost(tile):1) * SQ3; // units/sec
+      const travel = sp*remaining;
+      if (travel >= d){ e.x=w.x; e.y=w.y; e.path.shift(); remaining -= d/sp; }
+      else { e.x += dx/d*travel; e.y += dy/d*travel; remaining = 0; }
+    }
+    const h = uToHex(e.x, e.y); e.q=h.q; e.r=h.r;
+    if (!e.path.length) e.goal=null;            // arrived at the end of the path
+  }
 }
 function warehouse(){ return G.ents.find(e=>e.type==="warehouse"); }
 // a deep-water tile is bridgeable only where it's a narrow crossing
@@ -519,14 +539,14 @@ function spawnEdgeHex(walkableOnly){
   }
   return edge.length ? pick(edge) : null;
 }
-function spawnCows(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t) addEnt({type:"cow", q:t.q, r:t.r, timer:45+rnd(30)}); } }
+function spawnCows(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t) addEnt({type:"cow", q:t.q, r:t.r, timer:45+rnd(30), baseSpeed:0.6}); } }
 function spawnTrader(){
   if (!villageConnected()) return false;             // cut-off villages get no traders
   const t=spawnEdgeHex(true); if(!t) return false;
   addEnt({type:"trader", q:t.q, r:t.r, timer:38+rnd(20), stock:{res:"tools", amt:2+rnd(3)}});
   return true;
 }
-function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0, acd:0, spawn:{q:t.q,r:t.r}, thief:Math.random()<0.4, loot:null}); } } }
+function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2), thief=Math.random()<0.4; addEnt({type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, acd:0, spawn:{q:t.q,r:t.r}, thief, loot:null, baseSpeed: thief?1.8:1.0}); } } }
 function loseVillager(reason){
   const vs = G.ents.filter(e=>e.type==="villager");
   if (vs.length<=1){ return false; }
@@ -545,7 +565,7 @@ function fireEvent(){
   const usable = e => !e.trade || villageConnected();
   const bad = EVENTS.filter(e=>e.bad && usable(e)), good = EVENTS.filter(e=>!e.bad && usable(e));
   let pool = good;
-  if (G.tick - (G.lastBadTick||-999) > 24 && Math.random()<0.5 && bad.length) pool = bad;
+  if (G.tick - (G.lastBadTick||-999) > 70 && Math.random()<0.5 && bad.length) pool = bad;
   if (!pool.length) pool = good.length ? good : EVENTS.filter(usable);
   const ev = pick(pool);
   if (ev.bad) G.lastBadTick = G.tick;
@@ -558,10 +578,11 @@ function logicTick(){
   G.tick++;
   const hq = warehouse() || G.ents.find(e=>e.type==="house");   // raid/spawn anchor
 
-  if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 18 + rnd(16); }
+  if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 75 + rnd(55); }   // ~50-90s between events
 
   for (const v of G.ents){
-    if (v.type!=="villager" || !v.task) continue;
+    if (v.type!=="villager") continue;
+    if (!v.task){ v.goal=null; v.path=null; continue; }   // idle villagers stand still
     if (v.task.kind==="muster") handleMuster(v);
     else if (v.task.kind==="recover") handleRecover(v);
     else if (v.task.kind==="buildtower" || v.task.kind==="man") handleTower(v);
@@ -575,12 +596,14 @@ function logicTick(){
       // cows wander the map unless a villager is actively tending them
       const tended = G.ents.some(x=>x.type==="villager"&&x.task&&x.task.kind==="tend"
                                    &&x.task.targetId===e.id&&x.task.phase!=="home");
-      e.wcd = (e.wcd||0) - 1;
-      if (!tended && e.wcd<=0){
-        e.wcd = 4 + rnd(4);
-        const opts = DIRS.map(([dq,dr])=>G.map.get(key(e.q+dq,e.r+dr)))
-                         .filter(t=>t && isWalkable(t));
-        if (opts.length){ const t=pick(opts); e.q=t.q; e.r=t.r; }
+      if (tended){ e.goal=null; e.path=null; }
+      else {
+        e.wcd = (e.wcd||0) - 1;
+        if (e.wcd<=0 && !e.goal){
+          e.wcd = 6 + rnd(6);
+          const opts = DIRS.map(([dq,dr])=>G.map.get(key(e.q+dq,e.r+dr))).filter(t=>t && isWalkable(t));
+          if (opts.length){ const t=pick(opts); stepToward(e, {q:t.q,r:t.r}, false, 1); }
+        }
       }
     } else if (e.type==="trader"){
       if (--e.timer<=0){ removeEnt(e.id); log("🛒 The traders moved on."); }
@@ -830,7 +853,7 @@ function marauderAct(e){
     e.stuck = (r===null) ? (e.stuck||0)+1 : 0;
     return r;
   };
-  const spd = e.thief ? 0.6 : 0.34;        // thieves are fleet-footed
+  const spd = 1;                           // speed comes from baseSpeed (thieves are faster)
   // carrying loot -> flee back the way they came, off the map
   if (e.loot){
     const goal = e.spawn || {q:e.q,r:e.r};
@@ -1121,8 +1144,8 @@ const EVENTS = [
   { title:"Thieves in the Night", bad:true,
     text:"Word spreads of nimble thieves prowling the roads — they prey on villagers hauling goods.",
     options:[
-      { label:"Recall the haulers (🔔)", fn:()=>{ for(let i=0;i<2;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder",q:t.q,r:t.r,hp,maxhp:hp,mp:0,acd:0,spawn:{q:t.q,r:t.r},thief:true,loot:null}); } } ringBell(); } },
-      { label:"Carry on regardless", fn:()=>{ for(let i=0;i<2;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder",q:t.q,r:t.r,hp,maxhp:hp,mp:0,acd:0,spawn:{q:t.q,r:t.r},thief:true,loot:null}); } } } },
+      { label:"Recall the haulers (🔔)", fn:()=>{ for(let i=0;i<2;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder",q:t.q,r:t.r,hp,maxhp:hp,acd:0,spawn:{q:t.q,r:t.r},thief:true,loot:null,baseSpeed:1.8}); } } ringBell(); } },
+      { label:"Carry on regardless", fn:()=>{ for(let i=0;i<2;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder",q:t.q,r:t.r,hp,maxhp:hp,acd:0,spawn:{q:t.q,r:t.r},thief:true,loot:null,baseSpeed:1.8}); } } } },
     ] },
   { title:"The River Floods", bad:true,
     text:"Storms swell the waters upstream. The river breaks its banks and surges across the low ground — get clear of the water!",
@@ -1437,7 +1460,13 @@ function tileTop(t){
   return mix(GRASS, t.elev*0.07);                 // hills brighter, dips darker — lighting, not colour
 }
 
-function draw(){
+let lastTs = 0;
+function draw(ts){
+  const now = (ts!=null) ? ts : (globalThis.performance ? performance.now() : Date.now());
+  let dt = (now - lastTs) / 1000; lastTs = now;
+  if (!(dt>0)) dt = 0; if (dt>0.1) dt = 0.1;     // clamp big gaps (tab switch)
+  if (!G.paused && !G.over) moveEntities(dt);     // real-time, continuous movement
+
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.fillStyle = "#0e131b"; ctx.fillRect(0,0,cv.width,cv.height);
 
@@ -1493,7 +1522,6 @@ function draw(){
     }
   }
 
-  updateAnim();
   drawPaths();
   drawShots();
 
@@ -1504,10 +1532,10 @@ function draw(){
     if (selEnt && selEnt.homeOf) hi = selEnt.homeOf;
   }
 
-  const ents = [...G.ents].sort((a,b)=> (a.ay-b.ay) || (a.ax-b.ax));
+  const ents = [...G.ents].sort((a,b)=> (a.y-b.y) || (a.x-b.x));
   for (const e of ents){
     const lift = liftOf(e.q,e.r);
-    const cx = e.ax+cam.x, cy = e.ay+cam.y - lift - HEX*0.18;
+    const cx = e.x*HEX+cam.x, cy = e.y*HEX+cam.y - lift - HEX*0.18;
     if (e.id===hi){
       ctx.beginPath(); ctx.arc(cx, cy, HEX*0.6, 0, 7);
       ctx.strokeStyle="#ffe066"; ctx.lineWidth=2.5; ctx.stroke();
@@ -1545,27 +1573,18 @@ function drawShots(){
 
 function liftOf(q,r){ const t=G.map.get(key(q,r)); return t && t.elev>0 ? t.elev*ELEV : 0; }
 
-// ease each entity's drawn pixel position toward its current hex (smooth sliding)
-function updateAnim(){
-  for (const e of G.ents){
-    const p = hexToPixel(e.q,e.r);
-    if (e.ax===undefined){ e.ax=p.x; e.ay=p.y; }
-    else { e.ax += (p.x-e.ax)*0.2; e.ay += (p.y-e.ay)*0.2; }
-  }
-}
-
 // faint dotted path lines along planned routes
 function drawPaths(){
   ctx.save(); ctx.setLineDash([3,5]); ctx.lineWidth=1.5;
   for (const e of G.ents){
-    if (!e.pathCells || !e.pathCells.length) continue;
+    if (!e.path || !e.path.length) continue;
     if (e.type!=="villager" && e.type!=="marauder") continue;
     ctx.strokeStyle = e.type==="marauder" ? "rgba(227,96,79,0.40)" : "rgba(235,242,251,0.30)";
     ctx.beginPath();
-    ctx.moveTo(e.ax+cam.x, e.ay+cam.y - liftOf(e.q,e.r) - HEX*0.1);
-    for (const c of e.pathCells){
-      const p = hexToPixel(c.q,c.r);
-      ctx.lineTo(p.x+cam.x, p.y+cam.y - liftOf(c.q,c.r) - HEX*0.1);
+    ctx.moveTo(e.x*HEX+cam.x, e.y*HEX+cam.y - liftOf(e.q,e.r) - HEX*0.1);
+    for (const c of e.path){
+      const p = uPix(c.q,c.r);
+      ctx.lineTo(p.x*HEX+cam.x, p.y*HEX+cam.y - liftOf(c.q,c.r) - HEX*0.1);
     }
     ctx.stroke();
   }
@@ -1680,7 +1699,7 @@ function saveGame(){
   try{
     const tiles=[];
     for (const t of G.map.values()) tiles.push({q:t.q,r:t.r,elev:t.elev,improve:t.improve,isSea:t.isSea,wet:t.wet,bridge:t.bridge});
-    const ents = G.ents.map(e=>{ const c={...e}; delete c.ax; delete c.ay; delete c.pathCells; return c; });
+    const ents = G.ents.map(e=>{ const c={...e}; delete c.path; delete c.goal; delete c.pathCells; delete c.ax; delete c.ay; return c; });
     localStorage.setItem(SAVE_KEY, JSON.stringify({
       ver:1, res:G.res, pop:G.pop, day:G.day, tick:G.tick,
       nextEvent:G.nextEvent, lastBadTick:G.lastBadTick, alarm:G.alarm, over:G.over, nextId, tiles, ents
@@ -1694,7 +1713,7 @@ function loadGame(){
     G.map.clear();
     for (const t of d.tiles) G.map.set(key(t.q,t.r),
       { q:t.q, r:t.r, elev:t.elev, improve:t.improve||null, isSea:!!t.isSea, wet:!!t.wet, bridge:!!t.bridge });
-    G.ents = (d.ents||[]).map(e=>({...e}));
+    G.ents = (d.ents||[]).map(e=>{ const c={...e}; if(c.x===undefined){ const p=uPix(c.q,c.r); c.x=p.x; c.y=p.y; } return c; });
     G.res = Object.assign({...START_RES}, d.res||{});
     G.pop=d.pop|0; G.day=d.day|0; G.tick=d.tick|0;
     G.nextEvent=d.nextEvent|0; G.lastBadTick=d.lastBadTick??-999;
@@ -1711,7 +1730,7 @@ function newGame(){ clearSave(); restart(); }
 function restart(){
   G.res={...START_RES}; G.pop=0;
   G.day=0; G.tick=0; G.selHex=null; G.placing=null; G.paused=false; G.alarm=false; G.shots=[];
-  G.nextEvent=14; G.lastBadTick=-999; G.over=false;
+  G.nextEvent=60; G.lastBadTick=-999; G.over=false;
   closeEvent();
   logEl.innerHTML="";
   setupStart(); resize(); renderStats(); refreshPanel(); saveGame();
