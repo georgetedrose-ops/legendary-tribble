@@ -77,6 +77,41 @@
   }
   #log div { margin: 1px 0; }
   #hint { font-size: 11px; color: var(--muted); text-align: center; }
+
+  /* ---- pixel event modal ---- */
+  #event {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(8,11,16,.74);
+    display: flex; align-items: center; justify-content: center; padding: 18px;
+  }
+  #event.hidden { display: none; }
+  .ebox {
+    background: #0e141d; max-width: 350px; width: 100%; padding: 16px;
+    border: 3px solid #cdd6e0;
+    box-shadow: 0 0 0 3px #0e141d, 0 0 0 6px #59708a, 6px 6px 0 6px rgba(0,0,0,.5);
+    font-family: "Courier New", ui-monospace, monospace;
+    -webkit-font-smoothing: none; font-smooth: never; image-rendering: pixelated;
+  }
+  .etitle {
+    color: #ffe066; font-size: 14px; font-weight: 700; margin-bottom: 10px;
+    text-transform: uppercase; letter-spacing: 2px;
+    text-shadow: 2px 2px 0 #000;
+  }
+  .etext {
+    color: #bfe7c4; font-size: 13px; line-height: 1.55; min-height: 66px;
+    white-space: pre-wrap; text-shadow: 1px 1px 0 #000;
+  }
+  .etext .caret { color:#bfe7c4; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .eopts { display: flex; flex-direction: column; gap: 7px; margin-top: 14px; }
+  .eopt {
+    width: 100%; text-align: left; padding: 10px 12px;
+    background: #182334; color: #e8eef5; font-family: inherit; font-size: 13px;
+    border: 2px solid #59708a; box-shadow: 3px 3px 0 #000; cursor: pointer;
+    text-shadow: 1px 1px 0 #000;
+  }
+  .eopt:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 #000; }
+  .eopt:disabled { opacity: .4; }
 </style>
 </head>
 <body>
@@ -87,10 +122,17 @@
     <div id="toast"></div>
   </div>
   <div id="panel">
-    <div id="sel">Tap a hex to inspect. Tap the house to ready a villager, then tap a target.</div>
+    <div id="sel">Tap a hex to inspect. Tap a forest, quarry, cow or marauder to put a villager to work.</div>
     <div id="actions"></div>
     <div id="log"></div>
     <div id="hint">Tap a hex + swipe up = raise · swipe down = lower. Or use the buttons.</div>
+  </div>
+  <div id="event" class="hidden">
+    <div class="ebox" id="ebox">
+      <div class="etitle" id="etitle"></div>
+      <div class="etext" id="etext"></div>
+      <div class="eopts" id="eopts"></div>
+    </div>
   </div>
 </div>
 
@@ -161,14 +203,17 @@ function tileName(t){
 }
 
 // ---------- game state ----------
+const START_RES = { food:12, milk:0, wood:8, stone:3, gold:6, leather:0 };
 const G = {
   map: new Map(),
   ents: [],
-  res: { food:8, milk:0, wood:6, gold:5 },
-  pop: 0, popCap: 3,
+  res: { ...START_RES },
+  pop: 0,
   day: 0, tick: 0,
   selHex: null,
-  ready: false,
+  placing: null,     // 'watchtower' while siting a building
+  paused: false,     // true while an event modal is open
+  shots: [],         // transient watchtower arrow effects
   nextEvent: 14,
   over: false,
 };
@@ -239,11 +284,29 @@ function setupStart(){
   }
   if (!home){ home = G.map.get(key(0,0)); home.elev = 0; home.isSea=false; computeWater(); }
   addEnt({ type:"warehouse", q:home.q, r:home.r });   // central HQ — all resources deposit here
+  placeHouse(home); placeHouse(home);                 // a home for each starting villager
   spawnVillager(home.q, home.r);
   spawnVillager(home.q, home.r);
   G.pop = 2;
-  log("Your village begins at the warehouse. Tap it for stats; hold it to sound the alarm.");
+  log("Your village begins. Each villager has a home; tap a home to find its owner.");
 }
+
+// find a free walkable tile near `near` that has no building/improvement on it
+function freeTileNear(near, avoidType){
+  for (let d=1; d<=RADIUS; d++){
+    const ring = [...G.map.values()].filter(t=>hexDist(t,near)===d && isWalkable(t) && !t.improve
+      && !G.ents.some(e=>e.q===t.q&&e.r===t.r&&(e.type==="warehouse"||e.type==="house"||e.type==="watchtower")));
+    if (ring.length) return pick(ring);
+  }
+  return null;
+}
+function placeHouse(near){
+  const t = freeTileNear(near||warehouse()||{q:0,r:0});
+  if (!t) return null;
+  return addEnt({ type:"house", q:t.q, r:t.r, homeOf:null });
+}
+const houseCount = ()=>G.ents.filter(e=>e.type==="house").length;
+const freeHouse  = ()=>G.ents.find(e=>e.type==="house" && !e.homeOf);
 
 function spawnVillager(q,r){
   let spot = {q,r};
@@ -251,7 +314,10 @@ function spawnVillager(q,r){
     const t = G.map.get(key(q+dq,r+dr));
     if (t && isWalkable(t) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
   }
-  return addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0 });
+  const v = addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0, homeId:null });
+  const h = freeHouse();
+  if (h){ h.homeOf = v.id; v.homeId = h.id; }
+  return v;
 }
 
 // ---------- pathfinding: least-cost (Dijkstra over move costs) ----------
@@ -332,17 +398,20 @@ function nearestIdleVillager(q,r){
 }
 // gather jobs haul a resource home; instant jobs act in place
 const GATHER = {
-  chop: { res:"wood", amt:2, work:3, stock:"wood",  verb:"chopping" },
-  mine: { res:"gold", amt:2, work:4, stock:"stone", verb:"mining" },
-  farm: { res:"food", amt:2, work:3, stock:null,    verb:"farming" },
-  tend: { res:"milk", amt:2, work:2, stock:null,    verb:"tending" },
+  chop: { res:"wood",  amt:2, work:3, stock:"wood",  verb:"chopping" },
+  mine: { res:"stone", amt:2, work:4, stock:"stone", verb:"mining" },
+  farm: { res:"food",  amt:2, work:3, stock:null,    verb:"farming" },
+  tend: { res:"milk",  amt:2, work:2, stock:null,    verb:"tending", bonus:"leather" }, // cows: milk + occasional leather
 };
 function assignTask(kind, target){
   const v = nearestIdleVillager(target.q, target.r);
   if (!v){ flash("All villagers are busy — recall one first."); return false; }
   v.task = { kind, q:target.q, r:target.r, targetId: target.id || null, phase:"go" };
-  v.work = 0; v.carry = null;
+  v.work = 0; v.carry = null; v.stationed = false;
   return true;
+}
+function assignNearest(kind, target){
+  if (assignTask(kind, target)) flash("Villager dispatched.");
 }
 
 // ---------- terraform ----------
@@ -356,7 +425,7 @@ function terraform(q,r,dir){
   }
 }
 
-// ---------- events ----------
+// ---------- event spawn helpers ----------
 function spawnEdgeHex(walkableOnly){
   const edge = [];
   for (const t of G.map.values()){
@@ -364,38 +433,32 @@ function spawnEdgeHex(walkableOnly){
   }
   return edge.length ? pick(edge) : null;
 }
-function fireEvent(){
-  const roll = Math.random();
-  if (roll < 0.34){
-    const t = spawnEdgeHex(true); if(!t) return;
-    addEnt({ type:"cow", q:t.q, r:t.r, timer: 40 + rnd(30) });
-    log("🐄 A herd of cows wanders in. Send a villager to tend them for milk.");
-    flash("A herd of cows wanders in!");
-  } else if (roll < 0.62){
-    const t = spawnEdgeHex(true); if(!t) return;
-    addEnt({ type:"trader", q:t.q, r:t.r, timer: 34 + rnd(20) });
-    log("🛒 Traders pass through. Send a villager to sell milk & food for gold.");
-    flash("Traders are passing through!");
-  } else {
-    const t = spawnEdgeHex(true); if(!t) return;
-    const hp = 2 + rnd(2);
-    addEnt({ type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0 });
-    log("⚔️ Marauders approach the village! Fight them, or wall them out with hills & water.");
-    flash("⚔️ Marauders approach!");
-  }
+function spawnCows(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t) addEnt({type:"cow", q:t.q, r:t.r, timer:45+rnd(30)}); } }
+function spawnTrader(){ const t=spawnEdgeHex(true); if(t) addEnt({type:"trader", q:t.q, r:t.r, timer:38+rnd(20)}); }
+function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0}); } } }
+function loseVillager(reason){
+  const vs = G.ents.filter(e=>e.type==="villager");
+  if (vs.length<=1){ return false; }
+  const v = pick(vs);
+  if (v.homeId){ const h=G.ents.find(e=>e.id===v.homeId); if(h) h.homeOf=null; }
+  removeEnt(v.id); G.pop--;
+  if (reason) log(reason);
+  return true;
 }
+function fireEvent(){ openEvent(pick(EVENTS)); }
 
 // ---------- main logic tick ----------
 function logicTick(){
-  if (G.over) return;
+  if (G.over || G.paused) return;       // events pause the world
   G.tick++;
   const hq = warehouse() || G.ents.find(e=>e.type==="house");   // raid/spawn anchor
 
-  if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 16 + rnd(14); }
+  if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 18 + rnd(16); }
 
   for (const v of G.ents){
     if (v.type!=="villager" || !v.task) continue;
     if (v.task.kind==="return") handleReturn(v);
+    else if (v.task.kind==="buildtower" || v.task.kind==="man") handleTower(v);
     else if (GATHER[v.task.kind]) handleGather(v);
     else handleInstant(v);
   }
@@ -430,20 +493,32 @@ function logicTick(){
     }
   }
 
+  // watchtowers: a manned, built tower fires arrows at the nearest marauder in range
+  for (const tw of G.ents){
+    if (tw.type!=="watchtower" || !tw.built) continue;
+    const crew = tw.crew && G.ents.find(e=>e.id===tw.crew);
+    if (!crew || !crew.task || crew.task.kind!=="man" || !crew.stationed){ tw.crew=null; continue; }
+    if ((tw.cd=(tw.cd||0)-1) > 0) continue;
+    let tgt=null, bd=1e9;
+    for (const m of G.ents){ if (m.type!=="marauder") continue; const d=hexDist(m,tw); if (d<=tw.range && d<bd){ bd=d; tgt=m; } }
+    if (tgt){
+      tgt.hp--; tw.cd=2;
+      G.shots.push({ a:{q:tw.q,r:tw.r}, b:{q:tgt.q,r:tgt.r}, life:8 });
+      if (tgt.hp<=0){ removeEnt(tgt.id); G.res.gold+=2; log("🏹 The watchtower felled a marauder! +2 gold."); }
+    }
+  }
+
   // upkeep: villagers eat the food they've stored
   let food = G.res.food - G.pop * 0.05;
   if (food < 0){
     food = 0;
-    if (Math.random()<0.15 && G.pop>1){
-      const v = G.ents.find(e=>e.type==="villager");
-      if (v){ removeEnt(v.id); G.pop--; log("☠️ A villager starved. Assign a farmer!"); }
-    }
+    if (Math.random()<0.15) loseVillager("☠️ A villager starved. Assign a farmer!");
   }
   G.res.food = food;
 
-  if (G.res.food >= 12 && G.pop < G.popCap){
+  if (G.res.food >= 12 && G.pop < houseCount() && freeHouse()){
     G.res.food -= 10; G.pop++;
-    if (hq){ spawnVillager(hq.q, hq.r); log("👶 A new villager joins the village!"); flash("A new villager is born!"); }
+    if (hq){ spawnVillager(hq.q, hq.r); log("👶 A new villager moves into a free house!"); flash("A new villager is born!"); }
   }
 
   if (G.tick % 10 === 0) G.day++;
@@ -493,10 +568,34 @@ function handleGather(v){
     const arr = stepToward(v, {q:depot.q,r:depot.r}, true, 1);
     if (arr===null){ v.task=null; flash("A villager is stranded from the warehouse."); return; }
     if (arr){
-      if (v.carry){ G.res[v.carry.res] += v.carry.amt; log("📦 Deposited "+v.carry.amt+" "+v.carry.res+" at the warehouse."); v.carry=null; }
+      if (v.carry){
+        G.res[v.carry.res] += v.carry.amt;
+        let msg = "📦 Deposited "+v.carry.amt+" "+v.carry.res;
+        if (spec.bonus && Math.random()<0.4){ G.res[spec.bonus]++; msg += " (+1 "+spec.bonus+")"; }
+        log(msg+" at the warehouse."); v.carry=null;
+      }
       if (job.done){ v.task=null; return; }               // site exhausted
       job.phase="go"; v.work=0;                            // loop for another load
     }
+  }
+}
+
+// watchtower jobs: build it, then man it (the crew stays stationed and fires)
+function handleTower(v){
+  const tk = v.task;
+  const tw = G.ents.find(e=>e.id===tk.targetId);
+  if (!tw || tw.type!=="watchtower"){ v.task=null; v.stationed=false; return; }
+  const arr = stepToward(v, {q:tw.q,r:tw.r}, true, 1);
+  if (arr===null){ v.task=null; flash("A villager can't reach the tower."); return; }
+  if (!arr){ v.stationed=false; return; }
+  if (tk.kind==="buildtower"){
+    if (!tw.built){
+      v.work++;
+      if (v.work>=5){ tw.built=true; v.task=null; log("🗼 The watchtower is built — assign a villager to man it."); flash("Watchtower complete!"); }
+    } else v.task=null;
+  } else { // man: stay on post
+    if (!tw.built){ v.task=null; flash("The tower isn't built yet."); return; }
+    tw.crew = v.id; v.stationed = true;
   }
 }
 
@@ -515,7 +614,26 @@ function ringBell(){
   const wh = warehouse(); if (!wh) return;
   flash("🔔 Alarm! Villagers returning to the village.");
   log("🔔 The alarm bell rings — every villager rushes back to the warehouse.");
-  for (const v of G.ents) if (v.type==="villager"){ v.task={kind:"return"}; v.work=0; }
+  for (const v of G.ents) if (v.type==="villager"){ v.task={kind:"return"}; v.work=0; v.stationed=false; }
+}
+
+// ---------- watchtower placement & crewing ----------
+const TOWER_COST = { wood:6, stone:4 };
+function tryPlaceTower(h){
+  const t = G.map.get(key(h.q,h.r));
+  const occupied = G.ents.some(e=>e.q===h.q&&e.r===h.r);
+  if (!t || !isWalkable(t) || t.improve || occupied){ flash("Pick an empty, walkable tile."); return; }
+  if (G.res.wood<TOWER_COST.wood || G.res.stone<TOWER_COST.stone){ flash("Need 6 wood and 4 stone."); G.placing=null; return; }
+  G.res.wood-=TOWER_COST.wood; G.res.stone-=TOWER_COST.stone;
+  const tw = addEnt({ type:"watchtower", q:h.q, r:h.r, built:false, crew:null, cd:0, range:3 });
+  G.placing=null;
+  assignNearest("buildtower", tw);
+  log("🏗️ A watchtower is being raised here.");
+}
+function assignTower(tw){
+  if (!tw.built){ if(assignTask("buildtower",tw)) flash("A builder is on the way."); return; }
+  if (tw.crew && G.ents.some(e=>e.id===tw.crew)){ flash("This tower is already manned."); return; }
+  if (assignTask("man",tw)) flash("A villager will man the tower.");
 }
 
 // instant jobs act in place once the villager arrives
@@ -559,9 +677,9 @@ function doWork(v, tk, tq, tr){
       break;
     case "build":
       if (v.work>=4){
-        addEnt({type:"house", q:tq, r:tr});
-        G.popCap += 2; v.task=null;
-        log("🏠 A new house is built! Population cap increased.");
+        addEnt({type:"house", q:tq, r:tr, homeOf:null});
+        v.task=null;
+        log("🏠 A new house is built — room for another villager.");
         flash("New house built!");
       }
       break;
@@ -570,10 +688,11 @@ function doWork(v, tk, tq, tr){
       if (!tr2){ v.task=null; break; }
       if (v.work>=2){
         const sellMilk = Math.floor(G.res.milk);
+        const sellLeather = Math.floor(G.res.leather);
         const sellFood = Math.max(0, Math.floor(G.res.food)-4);
-        const gold = Math.floor(sellMilk*1.5 + sellFood*1);
+        const gold = Math.floor(sellMilk*1.5 + sellLeather*3 + sellFood*1);
         if (gold>0){
-          G.res.milk -= sellMilk; G.res.food -= sellFood; G.res.gold += gold;
+          G.res.milk -= sellMilk; G.res.leather -= sellLeather; G.res.food -= sellFood; G.res.gold += gold;
           log("🪙 Sold goods to traders for "+gold+" gold.");
           flash("+"+gold+" gold from trade!");
         } else flash("Nothing to sell.");
@@ -622,13 +741,115 @@ function renderStats(){
     ["🌾","Food", Math.floor(G.res.food)],
     ["🥛","Milk", Math.floor(G.res.milk)],
     ["🪵","Wood", Math.floor(G.res.wood)],
+    ["🪨","Stone", Math.floor(G.res.stone)],
+    ["🟫","Hide", Math.floor(G.res.leather)],
     ["🪙","Gold", Math.floor(G.res.gold)],
-    ["🧑","Pop", G.pop+"/"+G.popCap],
+    ["🧑","Pop", G.pop+"/"+houseCount()],
   ];
   statsEl.innerHTML = items.map(([ic,lb,val])=>
     `<div class="stat"><span class="ic">${ic}</span><span class="val">${val}</span><span class="lb">${lb}</span></div>`
   ).join("");
 }
+
+// ---------- random events (pixel modal, typed text + choices) ----------
+const can = (cost)=>Object.keys(cost).every(k=>G.res[k]>=cost[k]);
+const pay = (cost)=>{ for(const k in cost) G.res[k]-=cost[k]; };
+const EVENTS = [
+  { title:"A Lord's Decree",
+    text:"A passing lord, impressed by your thriving village, grants you leave to fortify these lands. Will you raise a watchtower to guard against raiders?",
+    options:[
+      { label:"⚔ Accept the honour", fn:()=>{ G.placing="watchtower"; flash("Tap an empty tile to place your watchtower (6🪵 4🪨)."); } },
+      { label:"Politely decline", fn:()=>{} },
+    ] },
+  { title:"Travelling Merchant",
+    text:"A merchant with a laden cart stops at your gate, eager to deal before nightfall.",
+    options:[
+      { label:"Buy 6 food (5🪙)", fn:()=>{ if(can({gold:5})){ pay({gold:5}); G.res.food+=6; } else flash("Not enough gold."); } },
+      { label:"Buy 5 wood (5🪙)", fn:()=>{ if(can({gold:5})){ pay({gold:5}); G.res.wood+=5; } else flash("Not enough gold."); } },
+      { label:"Send him on his way", fn:()=>{} },
+    ] },
+  { title:"Bandit Threat",
+    text:"Rough men ring the village. Their leader demands a tribute of 6 gold, or they will take it by force.",
+    options:[
+      { label:"Pay the tribute (6🪙)", fn:()=>{ if(can({gold:6})){ pay({gold:6}); } else { flash("You can't pay — they attack!"); spawnMarauders(2);} } },
+      { label:"Refuse them", fn:()=>{ spawnMarauders(2); flash("⚔️ The bandits attack!"); } },
+    ] },
+  { title:"Bountiful Harvest",
+    text:"Gentle rains and long sun have blessed your fields with more grain than the stores can hold.",
+    options:[ { label:"Rejoice (+8 food)", fn:()=>{ G.res.food+=8; } } ] },
+  { title:"A Wandering Family",
+    text:"A weary family appears on the road, asking to settle and work among your people.",
+    options:[
+      { label:"Welcome them in", fn:()=>{ const h=placeHouse(warehouse()); if(h){ spawnVillager(warehouse().q,warehouse().r); G.pop++; flash("The family joins your village!"); } else flash("No room to settle them."); } },
+      { label:"Turn them away", fn:()=>{} },
+    ] },
+  { title:"A Fever Spreads",
+    text:"A sickness creeps from house to house. The healers can hold it back — for a price.",
+    options:[
+      { label:"Pay the healers (6🪙)", fn:()=>{ if(can({gold:6})) pay({gold:6}); else { flash("No gold for healers…"); loseVillager("☠️ The fever took a villager."); } } },
+      { label:"Endure it", fn:()=>{ if(Math.random()<0.55) loseVillager("☠️ The fever took a villager."); else flash("The village pulls through."); } },
+    ] },
+  { title:"A Rich Seam",
+    text:"Diggers strike a seam of fine stone beneath the hills.",
+    options:[ { label:"Haul it home (+6 stone)", fn:()=>{ G.res.stone+=6; } } ] },
+  { title:"Roaming Cattle",
+    text:"A herd of cattle drifts onto your pastures, lowing softly.",
+    options:[
+      { label:"Let them graze", fn:()=>{ spawnCows(1+rnd(2)); flash("Send a farmer to tend them."); } },
+      { label:"Shoo them off", fn:()=>{} },
+    ] },
+  { title:"A Trade Caravan",
+    text:"Merchants make camp at the village edge, eager to barter your wares.",
+    options:[
+      { label:"Invite them in", fn:()=>{ spawnTrader(); flash("Send a villager to trade."); } },
+      { label:"Ignore them", fn:()=>{} },
+    ] },
+  { title:"Marauders Sighted!",
+    text:"Scouts come running — a warband marches on the village from the wilds!",
+    options:[
+      { label:"🔔 Sound the alarm", fn:()=>{ spawnMarauders(2+rnd(2)); ringBell(); } },
+      { label:"Stand and fight", fn:()=>{ spawnMarauders(2+rnd(2)); } },
+    ] },
+  { title:"A Dry Spell",
+    text:"The wells run shallow and the crops droop in the heat.",
+    options:[ { label:"Ration carefully (-4 food)", fn:()=>{ G.res.food=Math.max(0,G.res.food-4); } } ] },
+  { title:"Old Ruins Found",
+    text:"Children playing in the brush uncover a tumble of old worked stone and rotting timber.",
+    options:[ { label:"Salvage it (+3 wood, +3 stone)", fn:()=>{ G.res.wood+=3; G.res.stone+=3; } } ] },
+];
+
+const eventEl=document.getElementById("event"), eTitle=document.getElementById("etitle"),
+      eText=document.getElementById("etext"), eOpts=document.getElementById("eopts"), eBox=document.getElementById("ebox");
+let typeTimer=null, curEvent=null;
+function openEvent(ev){
+  curEvent=ev; G.paused=true;
+  eTitle.textContent=ev.title; eText.innerHTML=""; eOpts.innerHTML="";
+  eventEl.classList.remove("hidden");
+  let i=0; clearInterval(typeTimer);
+  typeTimer=setInterval(()=>{
+    i++;
+    eText.innerHTML = escapeHtml(ev.text.slice(0,i)) + (i<ev.text.length?"<span class='caret'>▌</span>":"");
+    if(i>=ev.text.length){ clearInterval(typeTimer); showOptions(ev); }
+  }, 16);
+}
+function finishTyping(){
+  if(!curEvent) return;
+  clearInterval(typeTimer);
+  eText.textContent=curEvent.text;
+  showOptions(curEvent);
+}
+function showOptions(ev){
+  if(eOpts.children.length) return;
+  ev.options.forEach(opt=>{
+    const b=document.createElement("button");
+    b.className="eopt"; b.textContent="› "+opt.label;
+    b.onclick=()=>{ opt.fn(); closeEvent(); renderStats(); refreshPanel(); };
+    eOpts.appendChild(b);
+  });
+}
+function closeEvent(){ eventEl.classList.add("hidden"); G.paused=false; curEvent=null; }
+function escapeHtml(s){ return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+eBox.addEventListener("pointerdown",e=>{ e.stopPropagation(); if(curEvent && eOpts.children.length===0) finishTyping(); });
 
 // ---------- bottom panel / context actions ----------
 const selEl = document.getElementById("sel");
@@ -640,38 +861,57 @@ function refreshPanel(){
     acts.push({label:"↻ Restart", cls:"go", fn:restart});
     renderActions(acts); return;
   }
+  if (G.placing==="watchtower"){
+    selEl.innerHTML = "<b>Siting a watchtower</b> — tap an empty, walkable tile (costs 6🪵 4🪨).";
+    acts.push({label:"✖ Cancel", cls:"down", fn:()=>{ G.placing=null; flash("Cancelled."); refreshPanel(); }});
+    renderActions(acts); return;
+  }
   const h = G.selHex;
   if (!h){
-    selEl.innerHTML = G.ready
-      ? "Villager ready — tap a target hex, cow, trader or marauder."
-      : "Tap a hex to inspect. Tap the <b>house</b> to ready a villager.";
+    selEl.innerHTML = "Tap a forest, quarry, cow or marauder to set a villager to work. Tap a <b>home</b> to find its villager.";
     renderActions([]); return;
   }
   const t = G.map.get(key(h.q,h.r));
   if (!t){ G.selHex=null; renderActions([]); return; }
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
-  let desc = `<b>${tileName(t)}</b> · elev ${t.elev>0?"+":""}${t.elev}`;
-  desc += isWalkable(t) ? " · "+speedWord(t) : " · impassable";
-  if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest"
-                       : t.improve.kind==="quarry" ? " · ⛏️ stone"
-                       : " · 🌾 farm";
+
   if (ent && ent.type==="warehouse"){
-    selEl.innerHTML = "<b>🏛️ Warehouse (HQ)</b> — "
-      + `🌾 ${Math.floor(G.res.food)} · 🥛 ${Math.floor(G.res.milk)} · 🪵 ${Math.floor(G.res.wood)} · 🪙 ${Math.floor(G.res.gold)} · 🧑 ${G.pop}/${G.popCap}`
+    selEl.innerHTML = "<b>🏛️ Warehouse (HQ)</b><br>"
+      + `🌾 ${Math.floor(G.res.food)} food · 🥛 ${Math.floor(G.res.milk)} milk · 🪵 ${Math.floor(G.res.wood)} wood · 🪨 ${Math.floor(G.res.stone)} stone · 🟫 ${Math.floor(G.res.leather)} hide · 🪙 ${Math.floor(G.res.gold)} gold · 🧑 ${G.pop}/${houseCount()}`
       + "<br><span style='font-size:11px'>Hold the warehouse to ring the alarm bell.</span>";
-    acts.push({label:"⚒️ Ready villager", cls:"go", fn:()=>{ G.ready=true; flash("Villager ready — pick a target."); refreshPanel(); }});
     acts.push({label:"🔔 Sound alarm", cls:"down", fn:()=>ringBell()});
     renderActions(acts); return;
   }
+  if (ent && ent.type==="house"){
+    const owner = ent.homeOf && G.ents.find(e=>e.id===ent.homeOf);
+    selEl.innerHTML = owner
+      ? `<b>🏠 Home</b> of a villager — <span style="color:#ffe066">highlighted</span> · ${villagerStatus(owner)}`
+      : "<b>🏠 Home</b> — empty, waiting for a villager.";
+    if (owner) acts.push({label:"📍 Select villager", cls:"go", fn:()=>{ G.selHex={q:owner.q,r:owner.r}; refreshPanel(); }});
+    renderActions(acts); return;
+  }
+  if (ent && ent.type==="watchtower"){
+    selEl.innerHTML = ent.built
+      ? `<b>🗼 Watchtower</b> — ${ent.crew?"manned, firing on raiders":"unmanned"} · range ${ent.range}`
+      : "<b>🗼 Watchtower</b> — under construction…";
+    if (!ent.built) acts.push({label:"🏗️ Send builder", fn:()=>assignTower(ent)});
+    else if (!ent.crew) acts.push({label:"🏹 Man the tower", cls:"go", fn:()=>assignTower(ent)});
+    else acts.push({label:"✋ Stand down", cls:"down", fn:()=>{ const c=G.ents.find(e=>e.id===ent.crew); if(c){c.task=null;c.stationed=false;} ent.crew=null; flash("The tower is unmanned."); refreshPanel(); }});
+    renderActions(acts); return;
+  }
+
+  let desc = `<b>${tileName(t)}</b> · elev ${t.elev>0?"+":""}${t.elev}`;
+  desc += isWalkable(t) ? " · "+speedWord(t) : " · impassable";
+  if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest"
+                       : t.improve.kind==="quarry" ? " · 🪨 quarry"
+                       : " · 🌾 farm";
   if (ent) desc += " · "+entLabel(ent.type);
   if (ent && ent.type==="villager") desc += " — "+villagerStatus(ent);
   selEl.innerHTML = desc;
 
-  if (ent && ent.type==="house")
-    acts.push({label:"⚒️ Ready villager", cls:"go", fn:()=>{ G.ready=true; flash("Villager ready — pick a target."); refreshPanel(); }});
   if (ent && ent.type==="villager" && ent.task)
-    acts.push({label:"✋ Recall", cls:"down", fn:()=>{ ent.task=null; ent.carry=null; flash("Villager recalled — now idle."); refreshPanel(); }});
-  if (ent && ent.type==="cow") acts.push({label:"🐄 Tend (milk)", cls:"go", fn:()=>cmd("tend",ent)});
+    acts.push({label:"✋ Recall", cls:"down", fn:()=>{ ent.task=null; ent.carry=null; ent.stationed=false; flash("Villager recalled — now idle."); refreshPanel(); }});
+  if (ent && ent.type==="cow") acts.push({label:"🐄 Tend (milk/hide)", cls:"go", fn:()=>cmd("tend",ent)});
   if (ent && ent.type==="trader") acts.push({label:"🛒 Trade", cls:"go", fn:()=>cmd("trade",ent)});
   if (ent && ent.type==="marauder") acts.push({label:"⚔️ Battle", cls:"go", fn:()=>cmd("battle",ent)});
 
@@ -680,33 +920,35 @@ function refreshPanel(){
     acts.push({label:"▼ Lower", cls:"down", dis:t.elev<=E_MIN, fn:()=>terraform(h.q,h.r,-1)});
   }
   if (t.improve && t.improve.kind==="forest" && !ent)
-    acts.push({label:"🪵 Chop wood", fn:()=>assignTask("chop",{q:h.q,r:h.r})});
+    acts.push({label:"🪵 Cut wood (forester)", fn:()=>assignTask("chop",{q:h.q,r:h.r})});
   if (t.improve && t.improve.kind==="quarry")
-    acts.push({label:"⛏️ Mine (gold)", fn:()=>assignTask("mine",{q:h.q,r:h.r})});
+    acts.push({label:"⛏️ Mine stone", fn:()=>assignTask("mine",{q:h.q,r:h.r})});
   if (t.elev===0 && !t.improve && !t.wet && !ent)
     acts.push({label:"🌾 Farm (food)", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
   if (t.improve && t.improve.kind==="farm" && !ent)
     acts.push({label:"🌾 Harvest (food)", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
-  if (t.elev>=0 && t.elev<=2 && !t.improve && !t.wet && !ent && G.res.wood>=4 && G.res.gold>=2)
-    acts.push({label:"🏠 Build house (4🪵 2🪙)", fn:()=>{
-      if (G.res.wood<4||G.res.gold<2){flash("Need 4 wood, 2 gold.");return;}
-      G.res.wood-=4; G.res.gold-=2; assignTask("build",{q:h.q,r:h.r});
+  if (t.elev>=0 && t.elev<=2 && !t.improve && !t.wet && !ent)
+    acts.push({label:"🏠 Build house (3🪵 2🪨)", fn:()=>{
+      if (!can({wood:3,stone:2})){flash("Need 3 wood, 2 stone.");return;}
+      pay({wood:3,stone:2}); assignTask("build",{q:h.q,r:h.r});
     }});
   renderActions(acts);
 }
 function entLabel(t){
-  return { warehouse:"🏛️ warehouse", house:"🏠 house", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder" }[t]||t;
+  return { warehouse:"🏛️ warehouse", house:"🏠 home", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder", watchtower:"🗼 watchtower" }[t]||t;
 }
 function villagerStatus(v){
   if (!v.task) return "idle";
   if (v.task.kind==="return") return "returning to the village";
+  if (v.task.kind==="man") return v.stationed ? "manning the watchtower" : "heading to the tower";
+  if (v.task.kind==="buildtower") return "building the watchtower";
   const g = GATHER[v.task.kind];
   if (g){
     if (v.carry || v.task.phase==="home") return "hauling "+g.res+" home";
     if (v.task.phase==="work") return g.verb;
     return "walking to "+g.verb.replace(/ing$/,"")+" site";
   }
-  return ({raise:"raising land",lower:"lowering land",build:"building",trade:"trading",battle:"fighting"})[v.task.kind]||"working";
+  return ({raise:"raising land",lower:"lowering land",build:"building a house",trade:"trading",battle:"fighting"})[v.task.kind]||"working";
 }
 function renderActions(acts){
   actEl.innerHTML="";
@@ -718,7 +960,7 @@ function renderActions(acts){
     actEl.appendChild(b);
   }
 }
-function cmd(kind, ent){ if (assignTask(kind, ent)){ flash("Villager dispatched."); G.ready=false; } }
+function cmd(kind, ent){ if (assignTask(kind, ent)) flash("Villager dispatched."); }
 
 // ---------- input: tap vs swipe ----------
 const cv = document.getElementById("cv");
@@ -754,20 +996,18 @@ function onUp(x,y){
   } else { G.selHex = h; refreshPanel(); }
 }
 function handleTap(h){
+  if (G.placing==="watchtower"){ tryPlaceTower(h); refreshPanel(); return; }
   G.selHex = h;
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
   const t = G.map.get(key(h.q,h.r));
-  if (ent && ent.type==="house"){ G.ready=true; flash("Villager ready — tap a target."); }
-  else if (G.ready && ent && ent.type==="cow"){ cmd("tend",ent); }
-  else if (G.ready && ent && ent.type==="trader"){ cmd("trade",ent); }
-  else if (G.ready && ent && ent.type==="marauder"){ cmd("battle",ent); }
-  else if (G.ready){
-    if (t.improve&&t.improve.kind==="forest"){ assignTask("chop",h); G.ready=false; }
-    else if (t.improve&&t.improve.kind==="quarry"){ assignTask("mine",h); G.ready=false; }
-    else if (t.improve&&t.improve.kind==="farm"){ assignTask("farm",h); G.ready=false; }
-    else if (t.elev===0&&!t.improve&&!t.wet){ assignTask("farm",h); G.ready=false; }
-    else flash("Pick an action below for this hex.");
-  }
+  // tapping something of interest puts the nearest idle villager to work on it
+  if (ent && ent.type==="cow") assignNearest("tend", ent);
+  else if (ent && ent.type==="trader") assignNearest("trade", ent);
+  else if (ent && ent.type==="marauder") assignNearest("battle", ent);
+  else if (ent && ent.type==="watchtower") assignTower(ent);
+  else if (!ent && t.improve && t.improve.kind==="forest") assignNearest("chop", h);
+  else if (!ent && t.improve && t.improve.kind==="quarry") assignNearest("mine", h);
+  else if (!ent && t.improve && t.improve.kind==="farm") assignNearest("farm", h);
   refreshPanel();
 }
 cv.addEventListener("pointerdown",e=>onDown(e.clientX,e.clientY));
@@ -899,14 +1139,41 @@ function draw(){
 
   updateAnim();
   drawPaths();
+  drawShots();
+
+  // villager whose home is currently selected gets a highlight ring
+  let hi = null;
+  if (G.selHex){
+    const selEnt = G.ents.find(e=>e.q===G.selHex.q&&e.r===G.selHex.r&&e.type==="house");
+    if (selEnt && selEnt.homeOf) hi = selEnt.homeOf;
+  }
 
   const ents = [...G.ents].sort((a,b)=> (a.ay-b.ay) || (a.ax-b.ax));
   for (const e of ents){
     const lift = liftOf(e.q,e.r);
     const cx = e.ax+cam.x, cy = e.ay+cam.y - lift - HEX*0.18;
+    if (e.id===hi){
+      ctx.beginPath(); ctx.arc(cx, cy, HEX*0.6, 0, 7);
+      ctx.strokeStyle="#ffe066"; ctx.lineWidth=2.5; ctx.stroke();
+    }
     drawEntity(e, cx, cy);
   }
   requestAnimationFrame(draw);
+}
+
+// fading watchtower arrows
+function drawShots(){
+  ctx.save(); ctx.lineWidth=2;
+  for (let i=G.shots.length-1;i>=0;i--){
+    const sh=G.shots[i]; const a=hexToPixel(sh.a.q,sh.a.r), b=hexToPixel(sh.b.q,sh.b.r);
+    ctx.strokeStyle=`rgba(255,230,150,${Math.max(0,sh.life/8)})`;
+    ctx.beginPath();
+    ctx.moveTo(a.x+cam.x, a.y+cam.y - liftOf(sh.a.q,sh.a.r) - HEX*0.6);
+    ctx.lineTo(b.x+cam.x, b.y+cam.y - liftOf(sh.b.q,sh.b.r) - HEX*0.18);
+    ctx.stroke();
+    if (--sh.life<=0) G.shots.splice(i,1);
+  }
+  ctx.restore();
 }
 
 function liftOf(q,r){ const t=G.map.get(key(q,r)); return t && t.elev>0 ? t.elev*ELEV : 0; }
@@ -941,6 +1208,21 @@ function drawPaths(){
 function drawEntity(e,cx,cy){
   const s = HEX*0.42;
   switch(e.type){
+    case "watchtower": {
+      const built = e.built;
+      ctx.fillStyle = built ? "#8b8f98" : "#6c7077"; ctx.strokeStyle="#2c2f34"; ctx.lineWidth=1.5;
+      ctx.fillRect(cx-s*0.5, cy-s*1.25, s*1.0, s*1.6); ctx.strokeRect(cx-s*0.5, cy-s*1.25, s*1.0, s*1.6);
+      if (built){
+        ctx.fillStyle="#9aa0a8";                            // crenellations
+        for (let i=0;i<3;i++) ctx.fillRect(cx-s*0.5+i*s*0.39, cy-s*1.5, s*0.27, s*0.3);
+        if (e.crew){ ctx.fillStyle="#f4f7fb"; ctx.beginPath(); ctx.arc(cx, cy-s*1.45, s*0.17, 0, 7); ctx.fill(); }
+      } else {
+        ctx.strokeStyle="#caa64a"; ctx.lineWidth=1.5;       // scaffolding
+        ctx.beginPath(); ctx.moveTo(cx-s*0.5,cy+s*0.35); ctx.lineTo(cx+s*0.5,cy-s*1.25);
+        ctx.moveTo(cx+s*0.5,cy+s*0.35); ctx.lineTo(cx-s*0.5,cy-s*1.25); ctx.stroke();
+      }
+      break;
+    }
     case "warehouse": {
       // stone HQ with a tall spire and a bell on top
       ctx.fillStyle="#837b6f"; ctx.strokeStyle="#34302a"; ctx.lineWidth=1.5;
@@ -1009,8 +1291,10 @@ function drawQuarry(cx,cy){
 
 // ---------- boot ----------
 function restart(){
-  G.res={food:8,milk:0,wood:6,gold:5}; G.pop=0; G.popCap=3;
-  G.day=0; G.tick=0; G.selHex=null; G.ready=false; G.nextEvent=14; G.over=false;
+  G.res={...START_RES}; G.pop=0;
+  G.day=0; G.tick=0; G.selHex=null; G.placing=null; G.paused=false; G.shots=[];
+  G.nextEvent=14; G.over=false;
+  closeEvent();
   logEl.innerHTML="";
   setupStart(); resize(); renderStats(); refreshPanel();
 }
