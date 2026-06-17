@@ -626,8 +626,8 @@ function logicTick(){
     if (hq){ spawnVillager(hq.q, hq.r); log("👶 A new villager moves into a free house!"); flash("A new villager is born!"); }
   }
 
-  if (G.tick % 10 === 0) G.day++;
-  if (G.pop<=0){ G.over=true; log("Your village has fallen. Tap Restart."); flash("Game over — your village is empty."); }
+  if (G.tick % 10 === 0){ G.day++; saveGame(); }
+  if (G.pop<=0){ G.over=true; log("Your village has fallen. Tap Restart."); flash("Game over — your village is empty."); saveGame(); }
 
   renderStats();
   refreshPanel();
@@ -1196,7 +1196,7 @@ function refreshPanel(){
   const acts = [];
   if (G.over){
     selEl.innerHTML = "<b>Your village has fallen.</b>";
-    acts.push({label:"↻ Restart", cls:"go", fn:restart});
+    acts.push({label:"↻ New village", cls:"go", fn:newGame});
     renderActions(acts); return;
   }
   if (G.placing==="watchtower"){
@@ -1219,6 +1219,7 @@ function refreshPanel(){
       + `🌾 ${Math.floor(G.res.food)} · 🥛 ${Math.floor(G.res.milk)} · 🪵 ${Math.floor(G.res.wood)} · 🪨 ${Math.floor(G.res.stone)} · 🟫 ${Math.floor(G.res.leather)} · 🛠️ ${Math.floor(G.res.tools)} · 🪙 ${Math.floor(G.res.gold)} · 🧑 ${G.pop}/${houseCount()}`
       + "<br><span style='font-size:11px'>"+(trade?"🛣️ Trade routes open.":"⛔ Cut off — no traders can reach you.")+" "+(G.alarm?"Alarm raised.":"Hold to ring the alarm.")+"</span>";
     acts.push({label: G.alarm?"✅ All clear":"🔔 Sound alarm", cls: G.alarm?"go":"down", fn:()=>toggleAlarm()});
+    acts.push({label:"🗺️ New map", fn:()=>{ if(confirm("Abandon this village and start a fresh map?")) newGame(); }});
     renderActions(acts); return;
   }
   if (ent && ent.type==="item"){
@@ -1673,20 +1674,55 @@ function drawBridge(cx,cy){
   for (let i=1;i<5;i++){ const x=cx-w/2+i*w/5; ctx.beginPath(); ctx.moveTo(x,cy-hh/2); ctx.lineTo(x,cy+hh/2); ctx.stroke(); }
 }
 
+// ---------- save / resume (localStorage) ----------
+const SAVE_KEY = "hexvillage.save.v1";
+function saveGame(){
+  try{
+    const tiles=[];
+    for (const t of G.map.values()) tiles.push({q:t.q,r:t.r,elev:t.elev,improve:t.improve,isSea:t.isSea,wet:t.wet,bridge:t.bridge});
+    const ents = G.ents.map(e=>{ const c={...e}; delete c.ax; delete c.ay; delete c.pathCells; return c; });
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      ver:1, res:G.res, pop:G.pop, day:G.day, tick:G.tick,
+      nextEvent:G.nextEvent, lastBadTick:G.lastBadTick, alarm:G.alarm, over:G.over, nextId, tiles, ents
+    }));
+  } catch(e){}
+}
+function loadGame(){
+  try{
+    const raw = localStorage.getItem(SAVE_KEY); if(!raw) return false;
+    const d = JSON.parse(raw); if(!d || d.ver!==1 || !Array.isArray(d.tiles) || !d.tiles.length) return false;
+    G.map.clear();
+    for (const t of d.tiles) G.map.set(key(t.q,t.r),
+      { q:t.q, r:t.r, elev:t.elev, improve:t.improve||null, isSea:!!t.isSea, wet:!!t.wet, bridge:!!t.bridge });
+    G.ents = (d.ents||[]).map(e=>({...e}));
+    G.res = Object.assign({...START_RES}, d.res||{});
+    G.pop=d.pop|0; G.day=d.day|0; G.tick=d.tick|0;
+    G.nextEvent=d.nextEvent|0; G.lastBadTick=d.lastBadTick??-999;
+    G.alarm=!!d.alarm; G.over=!!d.over; G.placing=null; G.paused=false; G.shots=[]; G.selHex=null;
+    nextId = d.nextId||1;
+    computeWater();
+    return true;
+  } catch(e){ return false; }
+}
+function clearSave(){ try{ localStorage.removeItem(SAVE_KEY); }catch(e){} }
+function newGame(){ clearSave(); restart(); }
+
 // ---------- boot ----------
 function restart(){
   G.res={...START_RES}; G.pop=0;
   G.day=0; G.tick=0; G.selHex=null; G.placing=null; G.paused=false; G.alarm=false; G.shots=[];
-  G.nextEvent=14; G.over=false;
+  G.nextEvent=14; G.lastBadTick=-999; G.over=false;
   closeEvent();
   logEl.innerHTML="";
-  setupStart(); resize(); renderStats(); refreshPanel();
+  setupStart(); resize(); renderStats(); refreshPanel(); saveGame();
 }
 
-setupStart();
+if (!loadGame()) setupStart();
 resize();
 renderStats(); refreshPanel();
 window.addEventListener("resize", ()=>{ HEX=26; resize(); });
+window.addEventListener("beforeunload", saveGame);
+document.addEventListener("visibilitychange", ()=>{ if(document.hidden) saveGame(); });
 draw();
 setInterval(logicTick, 700);
 </script>
