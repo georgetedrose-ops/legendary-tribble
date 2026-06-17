@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="theme-color" content="#1b2330" />
+<title>Hex Village</title>
+<style>
+  :root {
+    --bg: #141a24;
+    --panel: #1d2733;
+    --panel2: #243140;
+    --ink: #e8eef5;
+    --muted: #9fb0c2;
+    --accent: #5ec27a;
+    --gold: #f2c94c;
+    --danger: #e3604f;
+    --line: #32445a;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    user-select: none; -webkit-user-select: none;
+    touch-action: none;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  /* ---- top stat bar ---- */
+  #stats {
+    display: flex; gap: 4px; padding: 6px 8px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    overflow-x: auto; flex: 0 0 auto;
+  }
+  .stat {
+    display: flex; flex-direction: column; align-items: center;
+    min-width: 52px; padding: 2px 6px; border-radius: 8px;
+    background: var(--panel2);
+  }
+  .stat .ic { font-size: 15px; line-height: 1; }
+  .stat .val { font-size: 14px; font-weight: 700; margin-top: 1px; }
+  .stat .lb { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+
+  /* ---- canvas ---- */
+  #stage { position: relative; flex: 1 1 auto; min-height: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  /* event toast */
+  #toast {
+    position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
+    background: rgba(20,26,36,.92); border: 1px solid var(--line);
+    color: var(--ink); padding: 8px 14px; border-radius: 10px;
+    font-size: 13px; max-width: 90%; text-align: center;
+    opacity: 0; transition: opacity .3s; pointer-events: none;
+    box-shadow: 0 6px 18px rgba(0,0,0,.4);
+  }
+  #toast.show { opacity: 1; }
+
+  /* ---- bottom panel ---- */
+  #panel {
+    flex: 0 0 auto; background: var(--panel);
+    border-top: 1px solid var(--line); padding: 8px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #sel { font-size: 13px; color: var(--muted); min-height: 18px; line-height: 1.3; }
+  #sel b { color: var(--ink); }
+  #actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  button.act {
+    flex: 1 1 auto; min-width: 70px; padding: 11px 8px;
+    background: var(--panel2); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 10px;
+    font-size: 14px; font-weight: 600;
+  }
+  button.act:active { background: #2e4257; }
+  button.act:disabled { opacity: .35; }
+  button.act.up { border-color: #3a6f4c; }
+  button.act.down { border-color: #6f4a3a; }
+  button.act.go { background: #2c6e44; border-color: #3a8a57; }
+  #log {
+    height: 46px; overflow-y: auto; font-size: 11px; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 4px 6px; line-height: 1.4;
+  }
+  #log div { margin: 1px 0; }
+  #hint { font-size: 11px; color: var(--muted); text-align: center; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stats"></div>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="toast"></div>
+  </div>
+  <div id="panel">
+    <div id="sel">Tap a hex to inspect. Tap the house to ready a villager, then tap a target.</div>
+    <div id="actions"></div>
+    <div id="log"></div>
+    <div id="hint">Tap a hex + swipe up = raise · swipe down = lower. Or use the buttons.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================
+   HEX VILLAGE — a lightweight terraforming village sim
+   Single-file, no dependencies. Touch + mouse.
+   ============================================================ */
+
+// ---------- hex math (pointy-top, axial q,r) ----------
+const SQ3 = Math.sqrt(3);
+let HEX = 26;                 // hex radius in px (recomputed to fit)
+const ELEV = 5;              // px lift per height level
+const DIRS = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
+const key = (q,r)=>q+","+r;
+
+function hexToPixel(q,r){ return { x: HEX*SQ3*(q + r/2), y: HEX*1.5*r }; }
+function pixelToHex(px,py){
+  const q = (SQ3/3*px - 1/3*py)/HEX;
+  const r = (2/3*py)/HEX;
+  return cubeRound(q,r);
+}
+function cubeRound(q,r){
+  let x=q, z=r, y=-x-z;
+  let rx=Math.round(x), ry=Math.round(y), rz=Math.round(z);
+  const dx=Math.abs(rx-x), dy=Math.abs(ry-y), dz=Math.abs(rz-z);
+  if (dx>dy && dx>dz) rx=-ry-rz; else if (dy>dz) ry=-rx-rz; else rz=-rx-ry;
+  return { q: rx, r: rz };
+}
+function hexDist(a,b){
+  return (Math.abs(a.q-b.q) + Math.abs(a.q+a.r-b.q-b.r) + Math.abs(a.r-b.r))/2;
+}
+
+// ---------- terrain ----------
+// height 0 deep water,1 shallow water,2 sand,3 grass,4 hills,5 mountain
+const TERR = [
+  { name:"deep water", top:"#15557f", side:"#0e3c5c" },
+  { name:"water",      top:"#1f74a3", side:"#155777" },
+  { name:"sand",       top:"#d8c479", side:"#b3a25f" },
+  { name:"grass",      top:"#5fa64a", side:"#3f7833" },
+  { name:"hills",      top:"#3f7e34", side:"#2c5a25" },
+  { name:"mountain",   top:"#9aa0a6", side:"#6f747a" },
+];
+const isWater = h => h <= 1;
+const isWalkable = h => h >= 2 && h <= 4; // can't stand on deep mountain peak(5) or water
+
+// ---------- game state ----------
+const G = {
+  map: new Map(),       // key -> {q,r,height,improve}
+  ents: [],             // entities {id,type,q,r,...}
+  res: { food:8, milk:0, wood:6, gold:5 },
+  pop: 0, popCap: 3,
+  day: 0, tick: 0,
+  selHex: null,         // {q,r}
+  ready: false,         // a house is "commanding"
+  nextEvent: 14,
+  over: false,
+};
+let nextId = 1;
+const eid = ()=>"e"+(nextId++);
+const RADIUS = 4;
+const rnd = (n)=>Math.floor(Math.random()*n);
+const pick = (a)=>a[rnd(a.length)];
+
+// ---------- map generation ----------
+function genMap(){
+  G.map.clear();
+  for (let q=-RADIUS; q<=RADIUS; q++){
+    for (let r=-RADIUS; r<=RADIUS; r++){
+      if (Math.abs(q+r) > RADIUS) continue;
+      let h = 3; // grass default
+      const edge = (q + r); // diagonal gradient -> coastline on one side
+      if (edge <= -3) h = 0;
+      else if (edge <= -2) h = 1;
+      else {
+        const rr = Math.random();
+        if (rr < 0.05) h = 5;
+        else if (rr < 0.20) h = 4;
+        else if (rr < 0.27) h = 2;
+      }
+      G.map.set(key(q,r), { q, r, height:h, improve:null });
+    }
+  }
+  // scatter a few forests on grass/hills
+  let forests = 0;
+  for (const t of G.map.values()){
+    if (forests >= 6) break;
+    if ((t.height===3||t.height===4) && Math.random()<0.18){ t.improve = { kind:"forest", wood: 4 + rnd(4) }; forests++; }
+  }
+}
+
+// ---------- entities ----------
+function addEnt(e){ e.id = eid(); G.ents.push(e); return e; }
+function entAt(q,r,type){ return G.ents.find(e=>e.q===q&&e.r===r&&(!type||e.type===type)); }
+function removeEnt(id){ const i=G.ents.findIndex(e=>e.id===id); if(i>=0) G.ents.splice(i,1); }
+
+function setupStart(){
+  genMap();
+  G.ents.length = 0;
+  // find a grass hex near centre for the house
+  let home = null;
+  for (let d=0; d<=RADIUS && !home; d++){
+    for (const t of G.map.values()){
+      if (hexDist(t,{q:0,r:0})===d && t.height===3 && !t.improve){ home=t; break; }
+    }
+  }
+  if (!home){ home = G.map.get(key(0,0)); home.height = 3; }
+  addEnt({ type:"house", q:home.q, r:home.r });
+  // two villagers next to home
+  spawnVillager(home.q, home.r);
+  spawnVillager(home.q, home.r);
+  G.pop = 2;
+  log("Your village begins: one house, two villagers. Shape the land and survive.");
+}
+
+function spawnVillager(q,r){
+  // place on a walkable neighbour, else on the hex
+  let spot = {q,r};
+  for (const [dq,dr] of DIRS){
+    const t = G.map.get(key(q+dq,r+dr));
+    if (t && isWalkable(t.height) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
+  }
+  return addEnt({ type:"villager", q:spot.q, r:spot.r, px:spot.q, pr:spot.r, task:null, work:0, path:null });
+}
+
+// ---------- pathfinding (BFS over walkable) ----------
+function bfsNext(from, goal, goalAdjacentOk){
+  if (from.q===goal.q && from.r===goal.r) return null;
+  const start = key(from.q,from.r);
+  const seen = new Map(); seen.set(start, null);
+  const queue = [from];
+  let reached = null;
+  while (queue.length){
+    const cur = queue.shift();
+    if (cur.q===goal.q && cur.r===goal.r){ reached = cur; break; }
+    if (goalAdjacentOk && hexDist(cur,goal)===1){ reached = cur; break; }
+    for (const [dq,dr] of DIRS){
+      const nq=cur.q+dq, nr=cur.r+dr, k=key(nq,nr);
+      const t = G.map.get(k);
+      if (!t || seen.has(k)) continue;
+      const isGoal = (nq===goal.q && nr===goal.r);
+      if (!isWalkable(t.height) && !isGoal) continue;
+      if (isGoal && !isWalkable(t.height) && !goalAdjacentOk) continue;
+      seen.set(k, key(cur.q,cur.r));
+      queue.push({q:nq,r:nr});
+    }
+  }
+  if (!reached) return null;
+  // walk back to find first step
+  let k = key(reached.q,reached.r);
+  let prev = seen.get(k);
+  if (prev === start || prev == null) return reached; // first step
+  while (prev && prev !== start){ k = prev; prev = seen.get(k); }
+  const [q,r] = k.split(",").map(Number);
+  return {q,r};
+}
+
+// ---------- villager command ----------
+function nearestIdleVillager(q,r){
+  let best=null, bd=1e9;
+  for (const e of G.ents){
+    if (e.type!=="villager" || e.task) continue;
+    const d = hexDist(e,{q,r});
+    if (d<bd){ bd=d; best=e; }
+  }
+  return best;
+}
+
+function assignTask(kind, target){
+  const v = nearestIdleVillager(target.q, target.r);
+  if (!v){ flash("All villagers are busy."); return false; }
+  v.task = { kind, q:target.q, r:target.r, targetId: target.id || null };
+  v.work = 0;
+  return true;
+}
+
+// ---------- the things you can do to a hex ----------
+function terraform(q,r,dir){
+  const t = G.map.get(key(q,r));
+  if (!t) return;
+  if (dir>0 && t.height>=5){ flash("Already a mountain peak."); return; }
+  if (dir<0 && t.height<=0){ flash("Already deep water."); return; }
+  if (assignTask(dir>0?"raise":"lower", {q,r})){
+    flash((dir>0?"Raising":"Lowering")+" the "+TERR[t.height].name+"…");
+  }
+}
+
+// ---------- events ----------
+function spawnEdgeHex(walkableOnly){
+  const edge = [];
+  for (const t of G.map.values()){
+    if (hexDist(t,{q:0,r:0})>=RADIUS-1){
+      if (!walkableOnly || isWalkable(t.height)) edge.push(t);
+    }
+  }
+  return edge.length? pick(edge) : null;
+}
+
+function fireEvent(){
+  const roll = Math.random();
+  if (roll < 0.34){
+    const t = spawnEdgeHex(true); if(!t) return;
+    addEnt({ type:"cow", q:t.q, r:t.r, timer: 40 + rnd(30) });
+    log("🐄 A herd of cows wanders in. Send a villager to tend them for milk.");
+    flash("A herd of cows wanders in!");
+  } else if (roll < 0.62){
+    const t = spawnEdgeHex(true); if(!t) return;
+    addEnt({ type:"trader", q:t.q, r:t.r, timer: 34 + rnd(20) });
+    log("🛒 Traders pass through. Send a villager to sell milk & food for gold.");
+    flash("Traders are passing through!");
+  } else {
+    const t = spawnEdgeHex(true); if(!t) return;
+    const hp = 2 + rnd(2);
+    addEnt({ type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, moveCd: 3 });
+    log("⚔️ Marauders approach the village! Send a villager to fight, or they will raid you.");
+    flash("⚔️ Marauders approach!");
+  }
+}
+
+// ---------- main logic tick ----------
+function logicTick(){
+  if (G.over) return;
+  G.tick++;
+  const house = G.ents.find(e=>e.type==="house");
+
+  // event timer
+  if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 16 + rnd(14); }
+
+  // villagers
+  for (const v of G.ents){
+    if (v.type!=="villager") continue;
+    if (!v.task){ continue; }
+    const tk = v.task;
+    // resolve a possibly-moved entity target
+    let tq = tk.q, tr = tk.r;
+    if (tk.targetId){
+      const te = G.ents.find(e=>e.id===tk.targetId);
+      if (!te){ v.task=null; continue; }   // target gone
+      tq = te.q; tr = te.r;
+    }
+    const targetTile = G.map.get(key(tq,tr));
+    const needAdjacent = targetTile ? !isWalkable(targetTile.height) : true; // water/peak/entity-on-water
+    const atTarget = (v.q===tq && v.r===tr) || (needAdjacent && hexDist(v,{q:tq,r:tr})===1);
+    if (!atTarget){
+      const step = bfsNext({q:v.q,r:v.r}, {q:tq,r:tr}, needAdjacent);
+      if (!step){ v.task=null; flash("A villager can't reach that."); continue; }
+      v.q = step.q; v.r = step.r;
+      continue;
+    }
+    // at target: perform work
+    v.work++;
+    doWork(v, tk, tq, tr);
+  }
+
+  // entity behaviour
+  for (const e of [...G.ents]){
+    if (e.type==="cow"){
+      if (--e.timer<=0){ removeEnt(e.id); log("🐄 The cows wandered off."); }
+    } else if (e.type==="trader"){
+      if (--e.timer<=0){ removeEnt(e.id); log("🛒 The traders moved on."); }
+    } else if (e.type==="marauder"){
+      if (--e.moveCd<=0){
+        e.moveCd = 3;
+        if (house){
+          const step = bfsNext({q:e.q,r:e.r}, {q:house.q,r:house.r}, true);
+          if (step){ e.q=step.q; e.r=step.r; }
+          if (hexDist(e,house)<=1){
+            // raid!
+            const lost = Math.min(G.res.food, 3) + Math.min(G.res.gold,2);
+            G.res.food = Math.max(0, G.res.food-3);
+            G.res.gold = Math.max(0, G.res.gold-2);
+            removeEnt(e.id);
+            log("💥 Marauders raided the village! Lost food and gold.");
+            flash("💥 Your village was raided!");
+          }
+        }
+      }
+    }
+  }
+
+  // passive economy
+  let food = G.res.food, milk = G.res.milk;
+  for (const t of G.map.values()){
+    if (t.improve && t.improve.kind==="farm") food += 0.22;
+  }
+  food -= G.pop * 0.05;            // villagers eat
+  if (food < 0){
+    food = 0;
+    if (Math.random()<0.15 && G.pop>1){
+      const v = G.ents.find(e=>e.type==="villager");
+      if (v){ removeEnt(v.id); G.pop--; log("☠️ A villager starved. Keep food positive!"); }
+    }
+  }
+  G.res.food = food; G.res.milk = milk;
+
+  // population growth
+  if (G.res.food >= 12 && G.pop < G.popCap){
+    G.res.food -= 10; G.pop++;
+    const house2 = G.ents.find(e=>e.type==="house");
+    if (house2){ spawnVillager(house2.q, house2.r); log("👶 A new villager joins the village!"); flash("A new villager is born!"); }
+  }
+
+  // day counter
+  if (G.tick % 10 === 0){ G.day++; }
+
+  // lose condition
+  if (G.pop<=0){ G.over=true; log("Your village has fallen. Tap Restart."); flash("Game over — your village is empty."); }
+
+  renderStats();
+  refreshPanel();
+}
+
+function doWork(v, tk, tq, tr){
+  const tile = G.map.get(key(tq,tr));
+  switch (tk.kind){
+    case "raise":
+      if (v.work>=3){ if(tile.height<5) tile.height++; v.task=null; log("⛰️ Land raised to "+TERR[tile.height].name+"."); }
+      break;
+    case "lower":
+      if (v.work>=3){ if(tile.height>0) tile.height--; v.task=null; log("🌊 Land lowered to "+TERR[tile.height].name+"."); }
+      break;
+    case "farm":
+      if (v.work>=3){ tile.improve={kind:"farm"}; v.task=null; log("🌾 A farm is built — it yields food each day."); }
+      break;
+    case "chop":
+      if (v.work>=3){
+        const w = (tile.improve&&tile.improve.wood)||3;
+        G.res.wood += w; tile.improve=null; v.task=null;
+        log("🪵 Gathered "+w+" wood from the forest.");
+      }
+      break;
+    case "build":
+      if (v.work>=4){
+        addEnt({type:"house", q:tq, r:tr});
+        G.popCap += 2; v.task=null;
+        log("🏠 A new house is built! Population cap increased.");
+        flash("New house built!");
+      }
+      break;
+    case "tend": {
+      const cow = G.ents.find(e=>e.id===tk.targetId);
+      if (!cow){ v.task=null; break; }
+      if (v.work % 2 === 0){ G.res.milk += 1; }
+      // keep tending; villager frees when cow leaves (handled by target gone)
+      break;
+    }
+    case "trade": {
+      const tr2 = G.ents.find(e=>e.id===tk.targetId);
+      if (!tr2){ v.task=null; break; }
+      if (v.work>=2){
+        const sellMilk = Math.floor(G.res.milk);
+        const sellFood = Math.max(0, Math.floor(G.res.food)-4);
+        const gold = Math.floor(sellMilk*1.5 + sellFood*1);
+        if (gold>0){
+          G.res.milk -= sellMilk; G.res.food -= sellFood; G.res.gold += gold;
+          log("🪙 Sold goods to traders for "+gold+" gold.");
+          flash("+"+gold+" gold from trade!");
+        } else { flash("Nothing to sell."); }
+        v.task=null;
+      }
+      break;
+    }
+    case "battle": {
+      const m = G.ents.find(e=>e.id===tk.targetId);
+      if (!m){ v.task=null; break; }
+      if (v.work % 2 === 0){
+        m.hp--;
+        if (m.hp<=0){
+          removeEnt(m.id); v.task=null;
+          const reward = 2 + rnd(3);
+          G.res.gold += reward;
+          log("🛡️ Marauder defeated! Looted "+reward+" gold.");
+          flash("Marauder defeated! +"+reward+" gold");
+        }
+      }
+      break;
+    }
+  }
+}
+
+// ---------- logging / toast ----------
+const logEl = document.getElementById("log");
+function log(msg){
+  const d = document.createElement("div");
+  d.textContent = "Day "+G.day+": "+msg;
+  logEl.appendChild(d);
+  while (logEl.children.length>30) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+const toastEl = document.getElementById("toast");
+let toastT=null;
+function flash(msg){
+  toastEl.textContent = msg; toastEl.classList.add("show");
+  clearTimeout(toastT); toastT=setTimeout(()=>toastEl.classList.remove("show"), 2200);
+}
+
+// ---------- stat bar ----------
+const statsEl = document.getElementById("stats");
+function renderStats(){
+  const items = [
+    ["📅","Day", G.day],
+    ["🌾","Food", Math.floor(G.res.food)],
+    ["🥛","Milk", Math.floor(G.res.milk)],
+    ["🪵","Wood", Math.floor(G.res.wood)],
+    ["🪙","Gold", Math.floor(G.res.gold)],
+    ["🧑","Pop", G.pop+"/"+G.popCap],
+  ];
+  statsEl.innerHTML = items.map(([ic,lb,val])=>
+    `<div class="stat"><span class="ic">${ic}</span><span class="val">${val}</span><span class="lb">${lb}</span></div>`
+  ).join("");
+}
+
+// ---------- bottom panel / context actions ----------
+const selEl = document.getElementById("sel");
+const actEl = document.getElementById("actions");
+function refreshPanel(){
+  const acts = [];
+  if (G.over){
+    selEl.innerHTML = "<b>Your village has fallen.</b>";
+    acts.push({label:"↻ Restart", cls:"go", fn:restart});
+    renderActions(acts); return;
+  }
+  const h = G.selHex;
+  if (!h){
+    selEl.innerHTML = G.ready
+      ? "Villager ready — tap a target hex, cow, trader or marauder."
+      : "Tap a hex to inspect. Tap the <b>house</b> to ready a villager.";
+    renderActions([]); return;
+  }
+  const t = G.map.get(key(h.q,h.r));
+  if (!t){ G.selHex=null; renderActions([]); return; }
+  const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
+  let desc = `<b>${TERR[t.height].name}</b> (height ${t.height})`;
+  if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest" : " · 🌾 farm";
+  if (ent) desc += " · "+entLabel(ent.type);
+  selEl.innerHTML = desc;
+
+  // contextual actions
+  if (ent && ent.type==="house"){
+    acts.push({label:"⚒️ Ready villager", cls:"go", fn:()=>{ G.ready=true; flash("Villager ready — pick a target."); refreshPanel(); }});
+  }
+  if (ent && ent.type==="cow") acts.push({label:"🐄 Tend (milk)", cls:"go", fn:()=>cmd("tend",ent)});
+  if (ent && ent.type==="trader") acts.push({label:"🛒 Trade", cls:"go", fn:()=>cmd("trade",ent)});
+  if (ent && ent.type==="marauder") acts.push({label:"⚔️ Battle", cls:"go", fn:()=>cmd("battle",ent)});
+
+  if (!ent || ent.type==="villager"){
+    acts.push({label:"▲ Raise", cls:"up", fn:()=>terraform(h.q,h.r,1)});
+    acts.push({label:"▼ Lower", cls:"down", fn:()=>terraform(h.q,h.r,-1)});
+  }
+  if (t.improve && t.improve.kind==="forest" && !ent){
+    acts.push({label:"🪵 Chop wood", fn:()=>assignTask("chop",{q:h.q,r:h.r})});
+  }
+  if (t.height===3 && !t.improve && !ent){
+    acts.push({label:"🌾 Build farm", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
+  }
+  if ((t.height===3||t.height===4) && !t.improve && !ent && G.res.wood>=4 && G.res.gold>=2){
+    acts.push({label:"🏠 Build house (4🪵 2🪙)", fn:()=>{
+      if (G.res.wood<4||G.res.gold<2){flash("Need 4 wood, 2 gold.");return;}
+      G.res.wood-=4; G.res.gold-=2; assignTask("build",{q:h.q,r:h.r});
+    }});
+  }
+  renderActions(acts);
+}
+function entLabel(t){
+  return { house:"🏠 house", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder" }[t]||t;
+}
+function renderActions(acts){
+  actEl.innerHTML="";
+  for (const a of acts){
+    const b=document.createElement("button");
+    b.className="act"+(a.cls?" "+a.cls:"");
+    b.textContent=a.label;
+    b.onclick=(e)=>{ e.stopPropagation(); a.fn(); };
+    actEl.appendChild(b);
+  }
+}
+function cmd(kind, ent){
+  if (assignTask(kind, ent)){
+    flash("Villager dispatched.");
+    G.ready=false;
+  }
+}
+
+// ---------- input: tap vs swipe ----------
+const cv = document.getElementById("cv");
+let cam = {x:0,y:0};
+let down = null;
+function evToHex(clientX, clientY){
+  const rect = cv.getBoundingClientRect();
+  const px = clientX - rect.left - cam.x;
+  const py = clientY - rect.top - cam.y;
+  const h = pixelToHex(px, py);
+  return G.map.has(key(h.q,h.r)) ? h : null;
+}
+function onDown(x,y){ down = { x, y, t:Date.now(), hex: evToHex(x,y) }; }
+function onUp(x,y){
+  if (!down) return;
+  const dx = x-down.x, dy = y-down.y;
+  const dist = Math.hypot(dx,dy);
+  const h = down.hex;
+  down = null;
+  if (!h){ G.selHex=null; refreshPanel(); return; }
+  if (dist < 14){
+    handleTap(h);
+  } else if (Math.abs(dy) > 22 && Math.abs(dy) > Math.abs(dx)*1.1){
+    // vertical swipe = terraform
+    G.selHex = h;
+    terraform(h.q, h.r, dy<0 ? 1 : -1);
+    refreshPanel();
+  } else {
+    G.selHex = h; refreshPanel();
+  }
+}
+function handleTap(h){
+  G.selHex = h;
+  const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
+  if (ent && ent.type==="house"){ G.ready=true; flash("Villager ready — tap a target."); }
+  else if (G.ready && ent && ent.type==="cow"){ cmd("tend",ent); }
+  else if (G.ready && ent && ent.type==="trader"){ cmd("trade",ent); }
+  else if (G.ready && ent && ent.type==="marauder"){ cmd("battle",ent); }
+  else if (G.ready){
+    // tapped a plain hex while ready: do a sensible default
+    const t = G.map.get(key(h.q,h.r));
+    if (t.improve&&t.improve.kind==="forest"){ assignTask("chop",h); G.ready=false; }
+    else if (t.height===3&&!t.improve){ assignTask("farm",h); G.ready=false; }
+    else flash("Pick an action below for this hex.");
+  }
+  refreshPanel();
+}
+// pointer events (covers touch + mouse)
+cv.addEventListener("pointerdown",e=>{ onDown(e.clientX,e.clientY); });
+cv.addEventListener("pointerup",e=>{ onUp(e.clientX,e.clientY); });
+cv.addEventListener("pointercancel",()=>{ down=null; });
+cv.addEventListener("contextmenu",e=>e.preventDefault());
+
+// ---------- rendering ----------
+const ctx = cv.getContext("2d");
+let DPR = 1;
+function resize(){
+  const stage = document.getElementById("stage");
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  const w = stage.clientWidth, hgt = stage.clientHeight;
+  cv.width = w*DPR; cv.height = hgt*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  // fit grid: compute extent
+  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+  for (const t of G.map.values()){
+    const p = hexToPixel(t.q,t.r);
+    minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
+    minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
+  }
+  const gw = (maxX-minX)+HEX*2, gh=(maxY-minY)+HEX*2+ELEV*5;
+  const scale = Math.min(w/gw, hgt/gh, 1.3);
+  HEX = HEX*scale; // rescale base
+  // recompute extent after scale by recomputing center
+  minX=1e9;maxX=-1e9;minY=1e9;maxY=-1e9;
+  for (const t of G.map.values()){
+    const p = hexToPixel(t.q,t.r);
+    minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
+    minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
+  }
+  cam.x = w/2 - (minX+maxX)/2;
+  cam.y = hgt/2 - (minY+maxY)/2;
+}
+
+function hexCorners(cx,cy){
+  const pts=[];
+  for (let i=0;i<6;i++){
+    const a = Math.PI/180*(60*i+30);
+    pts.push([cx+HEX*Math.cos(a), cy+HEX*Math.sin(a)]);
+  }
+  return pts;
+}
+function poly(pts){
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0],pts[0][1]);
+  for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
+  ctx.closePath();
+}
+
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.fillStyle = "#0e131b";
+  ctx.fillRect(0,0,cv.width,cv.height);
+
+  // sort by r then q for painter's order (back to front)
+  const tiles = [...G.map.values()].sort((a,b)=> (a.r-b.r) || (a.q-b.q));
+  for (const t of tiles){
+    const p = hexToPixel(t.q,t.r);
+    const cx = p.x+cam.x, baseY=p.y+cam.y;
+    const lift = t.height*ELEV;
+    const topY = baseY - lift;
+    const topPts = hexCorners(cx, topY);
+    // side walls (front three edges)
+    if (lift>0){
+      ctx.fillStyle = TERR[t.height].side;
+      for (let i=0;i<6;i++){
+        const a=topPts[i], b=topPts[(i+1)%6];
+        const midY=(a[1]+b[1])/2;
+        if (midY > topY+1){ // lower edge -> draw skirt
+          poly([a,b,[b[0],b[1]+lift],[a[0],a[1]+lift]]);
+          ctx.fill();
+        }
+      }
+    }
+    // top face
+    poly(topPts);
+    ctx.fillStyle = TERR[t.height].top;
+    ctx.fill();
+    ctx.lineWidth=1; ctx.strokeStyle="rgba(0,0,0,.18)"; ctx.stroke();
+
+    // improvements
+    if (t.improve){
+      if (t.improve.kind==="forest") drawTrees(cx,topY);
+      else if (t.improve.kind==="farm") drawFarm(cx,topY);
+    }
+    // selection highlight
+    if (G.selHex && G.selHex.q===t.q && G.selHex.r===t.r){
+      poly(topPts);
+      ctx.lineWidth=3; ctx.strokeStyle="#ffe066"; ctx.stroke();
+    }
+  }
+
+  // entities (draw after tiles, sorted same way by their tile)
+  const ents = [...G.ents].sort((a,b)=>{
+    const ta=G.map.get(key(a.q,a.r)), tb=G.map.get(key(b.q,b.r));
+    return (ta.r-tb.r)||(ta.q-tb.q);
+  });
+  for (const e of ents){
+    const t = G.map.get(key(e.q,e.r)); if(!t) continue;
+    const p = hexToPixel(e.q,e.r);
+    const cx=p.x+cam.x, cy=p.y+cam.y - t.height*ELEV - HEX*0.18;
+    drawEntity(e, cx, cy);
+  }
+  requestAnimationFrame(draw);
+}
+
+function drawEntity(e,cx,cy){
+  const s = HEX*0.42;
+  switch(e.type){
+    case "house":
+      ctx.fillStyle="#8a5a32"; ctx.strokeStyle="#3a2412"; ctx.lineWidth=1.5;
+      ctx.fillRect(cx-s*0.7, cy-s*0.55, s*1.4, s*1.1); ctx.strokeRect(cx-s*0.7, cy-s*0.55, s*1.4, s*1.1);
+      // roof
+      ctx.fillStyle="#b5713f"; ctx.beginPath();
+      ctx.moveTo(cx-s*0.85,cy-s*0.55); ctx.lineTo(cx,cy-s*1.15); ctx.lineTo(cx+s*0.85,cy-s*0.55); ctx.closePath(); ctx.fill();
+      break;
+    case "villager":
+      ctx.fillStyle="#f4f7fb"; ctx.strokeStyle="#243140"; ctx.lineWidth=1.2;
+      ctx.fillRect(cx-s*0.35,cy-s*0.35,s*0.7,s*0.7); ctx.strokeRect(cx-s*0.35,cy-s*0.35,s*0.7,s*0.7);
+      break;
+    case "cow":
+      ctx.fillStyle="#f0f0f0"; ctx.beginPath(); ctx.ellipse(cx,cy,s*0.55,s*0.4,0,0,7); ctx.fill();
+      ctx.fillStyle="#2a2a2a"; ctx.beginPath(); ctx.arc(cx-s*0.2,cy,s*0.15,0,7); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx+s*0.18,cy+s*0.08,s*0.12,0,7); ctx.fill();
+      break;
+    case "trader":
+      ctx.fillStyle="#b07ad6"; ctx.beginPath(); ctx.arc(cx,cy,s*0.45,0,7); ctx.fill();
+      ctx.fillStyle="#fff"; ctx.font=`${s*0.7}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText("$",cx,cy+1);
+      break;
+    case "marauder": {
+      ctx.fillStyle="#e3604f"; ctx.strokeStyle="#5c1f17"; ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.moveTo(cx,cy-s*0.5); ctx.lineTo(cx+s*0.5,cy+s*0.4); ctx.lineTo(cx-s*0.5,cy+s*0.4); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      // hp pips
+      ctx.fillStyle="#fff"; ctx.font=`${s*0.5}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText(e.hp, cx, cy+s*0.12);
+      break;
+    }
+  }
+}
+function drawTrees(cx,cy){
+  const s=HEX*0.3;
+  for (const off of [[-0.3,0.1],[0.3,0.15],[0,-0.2]]){
+    const x=cx+off[0]*HEX, y=cy+off[1]*HEX;
+    ctx.fillStyle="#235c2a"; ctx.beginPath();
+    ctx.moveTo(x,y-s*0.9); ctx.lineTo(x+s*0.5,y+s*0.4); ctx.lineTo(x-s*0.5,y+s*0.4); ctx.closePath(); ctx.fill();
+  }
+}
+function drawFarm(cx,cy){
+  ctx.strokeStyle="#caa64a"; ctx.lineWidth=2;
+  for (let i=-1;i<=1;i++){
+    ctx.beginPath(); ctx.moveTo(cx-HEX*0.5, cy+i*HEX*0.22); ctx.lineTo(cx+HEX*0.5, cy+i*HEX*0.22); ctx.stroke();
+  }
+}
+
+// ---------- boot ----------
+function restart(){
+  G.res={food:8,milk:0,wood:6,gold:5}; G.pop=0; G.popCap=3;
+  G.day=0; G.tick=0; G.selHex=null; G.ready=false; G.nextEvent=14; G.over=false;
+  logEl.innerHTML="";
+  setupStart();
+  resize();
+  renderStats(); refreshPanel();
+}
+
+setupStart();
+resize();
+renderStats(); refreshPanel();
+window.addEventListener("resize", ()=>{ HEX=26; resize(); });
+draw();
+setInterval(logicTick, 700);
+</script>
+</body>
+</html>
