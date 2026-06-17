@@ -254,34 +254,66 @@ function spawnVillager(q,r){
   return addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0 });
 }
 
-// ---------- pathfinding (BFS over walkable) ----------
-function bfsNext(from, goal, goalAdjacentOk){
+// ---------- pathfinding: least-cost (Dijkstra over move costs) ----------
+// Returns the first step on the QUICKEST (lowest travel-time) path, honouring
+// per-tile move cost so routes prefer flat ground and avoid slow hills /
+// impassable rivers. goalAdjacentOk = stop on any tile next to the goal.
+function findStep(from, goal, goalAdjacentOk){
   if (from.q===goal.q && from.r===goal.r) return null;
   const start = key(from.q,from.r);
-  const seen = new Map(); seen.set(start, null);
-  const queue = [from];
+  const dist = new Map([[start,0]]);
+  const prev = new Map([[start,null]]);
+  const pq = [{k:start, q:from.q, r:from.r, d:0}];
   let reached = null;
-  while (queue.length){
-    const cur = queue.shift();
-    if (cur.q===goal.q && cur.r===goal.r){ reached = cur; break; }
-    if (goalAdjacentOk && hexDist(cur,goal)===1){ reached = cur; break; }
+  while (pq.length){
+    // pop lowest-cost node (small grid: linear scan is fine)
+    let bi=0; for (let i=1;i<pq.length;i++) if (pq[i].d<pq[bi].d) bi=i;
+    const cur = pq.splice(bi,1)[0];
+    if (cur.d > (dist.get(cur.k) ?? Infinity)) continue;
+    if (cur.q===goal.q && cur.r===goal.r){ reached=cur.k; break; }
+    if (goalAdjacentOk && hexDist(cur,goal)===1){ reached=cur.k; break; }
     for (const [dq,dr] of DIRS){
       const nq=cur.q+dq, nr=cur.r+dr, k=key(nq,nr);
-      const t = G.map.get(k);
-      if (!t || seen.has(k)) continue;
+      const t = G.map.get(k); if (!t) continue;
       const isGoal = (nq===goal.q && nr===goal.r);
       if (!isWalkable(t) && !(isGoal && !goalAdjacentOk)) continue;
-      seen.set(k, key(cur.q,cur.r));
-      queue.push({q:nq,r:nr});
+      const nd = cur.d + moveCost(t);
+      if (nd < (dist.get(k) ?? Infinity)){
+        dist.set(k,nd); prev.set(k,cur.k);
+        pq.push({k, q:nq, r:nr, d:nd});
+      }
     }
   }
   if (!reached) return null;
-  let k = key(reached.q,reached.r);
-  let prev = seen.get(k);
-  if (prev === start || prev == null) return reached;
-  while (prev && prev !== start){ k = prev; prev = seen.get(k); }
+  let k = reached, p = prev.get(k);
+  if (p === start || p == null){ const [q,r]=k.split(",").map(Number); return {q,r}; }
+  while (p && p !== start){ k = p; p = prev.get(k); }
   const [q,r] = k.split(",").map(Number);
   return {q,r};
+}
+
+// move one ent toward goal using accumulated move points; returns
+// true = arrived, false = still travelling, null = no path.
+function stepToward(ent, goal, adjacentOk, speed){
+  if (ent.q===goal.q && ent.r===goal.r) return true;
+  if (adjacentOk && hexDist(ent,goal)===1) return true;
+  const step = findStep({q:ent.q,r:ent.r}, goal, adjacentOk);
+  if (!step) return null;
+  ent.mp = Math.min((ent.mp||0) + speed, 3);
+  const cost = moveCost(G.map.get(key(step.q,step.r)));
+  if (ent.mp >= cost){ ent.mp -= cost; ent.q = step.q; ent.r = step.r; }
+  if (ent.q===goal.q && ent.r===goal.r) return true;
+  if (adjacentOk && hexDist(ent,goal)===1) return true;
+  return false;
+}
+function nearestHouse(from){
+  let best=null, bd=1e9;
+  for (const e of G.ents){
+    if (e.type!=="house") continue;
+    const d = hexDist(e,from);
+    if (d<bd){ bd=d; best=e; }
+  }
+  return best;
 }
 
 // ---------- villager command ----------
@@ -294,11 +326,18 @@ function nearestIdleVillager(q,r){
   }
   return best;
 }
+// gather jobs haul a resource home; instant jobs act in place
+const GATHER = {
+  chop: { res:"wood", amt:2, work:3, stock:"wood",  verb:"chopping" },
+  mine: { res:"gold", amt:2, work:4, stock:"stone", verb:"mining" },
+  farm: { res:"food", amt:2, work:3, stock:null,    verb:"farming" },
+  tend: { res:"milk", amt:2, work:2, stock:null,    verb:"tending" },
+};
 function assignTask(kind, target){
   const v = nearestIdleVillager(target.q, target.r);
-  if (!v){ flash("All villagers are busy."); return false; }
-  v.task = { kind, q:target.q, r:target.r, targetId: target.id || null };
-  v.work = 0;
+  if (!v){ flash("All villagers are busy — recall one first."); return false; }
+  v.task = { kind, q:target.q, r:target.r, targetId: target.id || null, phase:"go" };
+  v.work = 0; v.carry = null;
   return true;
 }
 
@@ -352,44 +391,29 @@ function logicTick(){
 
   for (const v of G.ents){
     if (v.type!=="villager" || !v.task) continue;
-    const tk = v.task;
-    let tq = tk.q, tr = tk.r;
-    if (tk.targetId){
-      const te = G.ents.find(e=>e.id===tk.targetId);
-      if (!te){ v.task=null; continue; }
-      tq = te.q; tr = te.r;
-    }
-    const targetTile = G.map.get(key(tq,tr));
-    // terraforming is always done from an adjacent tile (never stand on the edited hex)
-    const needAdjacent = (tk.kind==="raise"||tk.kind==="lower"||tk.kind==="mine") ? true
-                         : !isWalkable(targetTile);
-    const atTarget = (v.q===tq && v.r===tr) || (needAdjacent && hexDist(v,{q:tq,r:tr})===1);
-    if (!atTarget){
-      const step = bfsNext({q:v.q,r:v.r}, {q:tq,r:tr}, needAdjacent);
-      if (!step){ v.task=null; flash("A villager can't reach that."); continue; }
-      v.mp = Math.min((v.mp||0) + 1, 3);                  // 1 move point per tick
-      const cost = moveCost(G.map.get(key(step.q,step.r)));
-      if (v.mp >= cost){ v.mp -= cost; v.q = step.q; v.r = step.r; }
-      continue;
-    }
-    v.mp = 0;
-    v.work++;
-    doWork(v, tk, tq, tr);
+    if (GATHER[v.task.kind]) handleGather(v);
+    else handleInstant(v);
   }
 
   for (const e of [...G.ents]){
     if (e.type==="cow"){
-      if (--e.timer<=0){ removeEnt(e.id); log("🐄 The cows wandered off."); }
+      if (--e.timer<=0){ removeEnt(e.id); log("🐄 The cows wandered off."); continue; }
+      // cows wander the map unless a villager is actively tending them
+      const tended = G.ents.some(x=>x.type==="villager"&&x.task&&x.task.kind==="tend"
+                                   &&x.task.targetId===e.id&&x.task.phase!=="home");
+      e.wcd = (e.wcd||0) - 1;
+      if (!tended && e.wcd<=0){
+        e.wcd = 4 + rnd(4);
+        const opts = DIRS.map(([dq,dr])=>G.map.get(key(e.q+dq,e.r+dr)))
+                         .filter(t=>t && isWalkable(t));
+        if (opts.length){ const t=pick(opts); e.q=t.q; e.r=t.r; }
+      }
     } else if (e.type==="trader"){
       if (--e.timer<=0){ removeEnt(e.id); log("🛒 The traders moved on."); }
     } else if (e.type==="marauder"){
       if (house){
-        e.mp = Math.min((e.mp||0) + 0.34, 3);            // slower base pace; hills slow them further
-        const step = bfsNext({q:e.q,r:e.r}, {q:house.q,r:house.r}, true);
-        if (step){
-          const cost = moveCost(G.map.get(key(step.q,step.r)));
-          if (e.mp >= cost){ e.mp -= cost; e.q=step.q; e.r=step.r; }
-        }
+        // cost-aware path: marauders flow around hills and impassable rivers
+        const arr = stepToward(e, {q:house.q,r:house.r}, true, 0.34);
         if (hexDist(e,house)<=1){
           G.res.food = Math.max(0, G.res.food-3);
           G.res.gold = Math.max(0, G.res.gold-2);
@@ -401,15 +425,13 @@ function logicTick(){
     }
   }
 
-  // passive economy
-  let food = G.res.food;
-  for (const t of G.map.values()) if (t.improve && t.improve.kind==="farm") food += 0.22;
-  food -= G.pop * 0.05;
+  // upkeep: villagers eat the food they've stored
+  let food = G.res.food - G.pop * 0.05;
   if (food < 0){
     food = 0;
     if (Math.random()<0.15 && G.pop>1){
       const v = G.ents.find(e=>e.type==="villager");
-      if (v){ removeEnt(v.id); G.pop--; log("☠️ A villager starved. Keep food positive!"); }
+      if (v){ removeEnt(v.id); G.pop--; log("☠️ A villager starved. Assign a farmer!"); }
     }
   }
   G.res.food = food;
@@ -424,6 +446,71 @@ function logicTick(){
 
   renderStats();
   refreshPanel();
+}
+
+// gather loop: travel to work site -> gather -> carry home -> deposit -> repeat
+function handleGather(v){
+  const job = v.task, spec = GATHER[job.kind];
+  // resolve a live site (cows move; tile sites are fixed)
+  let sq=job.q, sr=job.r;
+  if (job.targetId){
+    const te = G.ents.find(e=>e.id===job.targetId);
+    if (!te){ v.task=null; v.carry=null; return; }       // cow gone
+    sq=te.q; sr=te.r;
+  }
+  const site = G.map.get(key(sq,sr));
+
+  if (job.phase==="go"){
+    const onTile = isWalkable(site) && job.kind!=="mine"; // quarry mined from adjacent
+    const arr = stepToward(v, {q:sq,r:sr}, !onTile, 1);
+    if (arr===null){ v.task=null; flash("A villager can't reach that work site."); return; }
+    if (arr){ job.phase="work"; v.work=0; }
+    return;
+  }
+  if (job.phase==="work"){
+    if (job.kind==="farm" && !site.improve) site.improve={kind:"farm"};
+    v.work++;
+    if (v.work>=spec.work){
+      let amt = spec.amt;
+      if (spec.stock && site.improve){
+        amt = Math.min(amt, site.improve[spec.stock]||0);
+        site.improve[spec.stock] -= amt;
+        if ((site.improve[spec.stock]||0) <= 0){ site.improve=null; job.done=true; }
+      }
+      v.carry = { res:spec.res, amt };
+      job.phase="home";
+    }
+    return;
+  }
+  if (job.phase==="home"){
+    const house = nearestHouse(v);
+    if (!house){ v.task=null; return; }
+    const arr = stepToward(v, {q:house.q,r:house.r}, true, 1);
+    if (arr===null){ v.task=null; flash("A villager is stranded from home."); return; }
+    if (arr){
+      if (v.carry){ G.res[v.carry.res] += v.carry.amt; log("📦 Deposited "+v.carry.amt+" "+v.carry.res+"."); v.carry=null; }
+      if (job.done){ v.task=null; return; }               // site exhausted
+      job.phase="go"; v.work=0;                            // loop for another load
+    }
+  }
+}
+
+// instant jobs act in place once the villager arrives
+function handleInstant(v){
+  const tk = v.task;
+  let tq=tk.q, tr=tk.r;
+  if (tk.targetId){
+    const te = G.ents.find(e=>e.id===tk.targetId);
+    if (!te){ v.task=null; return; }
+    tq=te.q; tr=te.r;
+  }
+  const tile = G.map.get(key(tq,tr));
+  const adj = (tk.kind==="raise"||tk.kind==="lower") ? true : !isWalkable(tile);
+  const arr = stepToward(v, {q:tq,r:tr}, adj, 1);
+  if (arr===null){ v.task=null; flash("A villager can't reach that."); return; }
+  if (!arr) return;
+  v.work++;
+  doWork(v, tk, tq, tr);
 }
 
 function doWork(v, tk, tq, tr){
@@ -447,24 +534,6 @@ function doWork(v, tk, tq, tr){
         log("🌊 Land lowered — now "+tileName(tile)+".");
       }
       break;
-    case "farm":
-      if (v.work>=3){ tile.improve={kind:"farm"}; v.task=null; log("🌾 A farm is built — it yields food each day."); }
-      break;
-    case "chop":
-      if (v.work>=3){
-        const w=(tile.improve&&tile.improve.wood)||3;
-        G.res.wood+=w; tile.improve=null; v.task=null;
-        log("🪵 Gathered "+w+" wood from the forest.");
-      }
-      break;
-    case "mine":
-      if (v.work>=4){
-        const s=(tile.improve&&tile.improve.stone)||4;
-        G.res.gold+=s; tile.improve=null; v.task=null;
-        log("⛏️ Mined the quarry for "+s+" gold worth of stone.");
-        flash("+"+s+" gold from the quarry!");
-      }
-      break;
     case "build":
       if (v.work>=4){
         addEnt({type:"house", q:tq, r:tr});
@@ -473,12 +542,6 @@ function doWork(v, tk, tq, tr){
         flash("New house built!");
       }
       break;
-    case "tend": {
-      const cow = G.ents.find(e=>e.id===tk.targetId);
-      if (!cow){ v.task=null; break; }
-      if (v.work % 2 === 0) G.res.milk += 1;
-      break;
-    }
     case "trade": {
       const tr2 = G.ents.find(e=>e.id===tk.targetId);
       if (!tr2){ v.task=null; break; }
@@ -570,10 +633,13 @@ function refreshPanel(){
                        : t.improve.kind==="quarry" ? " · ⛏️ stone"
                        : " · 🌾 farm";
   if (ent) desc += " · "+entLabel(ent.type);
+  if (ent && ent.type==="villager") desc += " — "+villagerStatus(ent);
   selEl.innerHTML = desc;
 
   if (ent && ent.type==="house")
     acts.push({label:"⚒️ Ready villager", cls:"go", fn:()=>{ G.ready=true; flash("Villager ready — pick a target."); refreshPanel(); }});
+  if (ent && ent.type==="villager" && ent.task)
+    acts.push({label:"✋ Recall", cls:"down", fn:()=>{ ent.task=null; ent.carry=null; flash("Villager recalled — now idle."); refreshPanel(); }});
   if (ent && ent.type==="cow") acts.push({label:"🐄 Tend (milk)", cls:"go", fn:()=>cmd("tend",ent)});
   if (ent && ent.type==="trader") acts.push({label:"🛒 Trade", cls:"go", fn:()=>cmd("trade",ent)});
   if (ent && ent.type==="marauder") acts.push({label:"⚔️ Battle", cls:"go", fn:()=>cmd("battle",ent)});
@@ -587,7 +653,9 @@ function refreshPanel(){
   if (t.improve && t.improve.kind==="quarry")
     acts.push({label:"⛏️ Mine (gold)", fn:()=>assignTask("mine",{q:h.q,r:h.r})});
   if (t.elev===0 && !t.improve && !t.wet && !ent)
-    acts.push({label:"🌾 Build farm", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
+    acts.push({label:"🌾 Farm (food)", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
+  if (t.improve && t.improve.kind==="farm" && !ent)
+    acts.push({label:"🌾 Harvest (food)", fn:()=>assignTask("farm",{q:h.q,r:h.r})});
   if (t.elev>=0 && t.elev<=2 && !t.improve && !t.wet && !ent && G.res.wood>=4 && G.res.gold>=2)
     acts.push({label:"🏠 Build house (4🪵 2🪙)", fn:()=>{
       if (G.res.wood<4||G.res.gold<2){flash("Need 4 wood, 2 gold.");return;}
@@ -597,6 +665,16 @@ function refreshPanel(){
 }
 function entLabel(t){
   return { house:"🏠 house", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder" }[t]||t;
+}
+function villagerStatus(v){
+  if (!v.task) return "idle";
+  const g = GATHER[v.task.kind];
+  if (g){
+    if (v.carry || v.task.phase==="home") return "hauling "+g.res+" home";
+    if (v.task.phase==="work") return g.verb;
+    return "walking to "+g.verb.replace(/ing$/,"")+" site";
+  }
+  return ({raise:"raising land",lower:"lowering land",build:"building",trade:"trading",battle:"fighting"})[v.task.kind]||"working";
 }
 function renderActions(acts){
   actEl.innerHTML="";
@@ -644,6 +722,7 @@ function handleTap(h){
   else if (G.ready){
     if (t.improve&&t.improve.kind==="forest"){ assignTask("chop",h); G.ready=false; }
     else if (t.improve&&t.improve.kind==="quarry"){ assignTask("mine",h); G.ready=false; }
+    else if (t.improve&&t.improve.kind==="farm"){ assignTask("farm",h); G.ready=false; }
     else if (t.elev===0&&!t.improve&&!t.wet){ assignTask("farm",h); G.ready=false; }
     else flash("Pick an action below for this hex.");
   }
@@ -801,6 +880,11 @@ function drawEntity(e,cx,cy){
     case "villager":
       ctx.fillStyle="#f4f7fb"; ctx.strokeStyle="#243140"; ctx.lineWidth=1.2;
       ctx.fillRect(cx-s*0.35,cy-s*0.35,s*0.7,s*0.7); ctx.strokeRect(cx-s*0.35,cy-s*0.35,s*0.7,s*0.7);
+      if (e.carry){                                       // a little load being carried home
+        const col={wood:"#8a5a32",gold:"#f2c94c",milk:"#eaf2fb",food:"#6ab150"}[e.carry.res]||"#fff";
+        ctx.fillStyle=col; ctx.beginPath(); ctx.arc(cx, cy-s*0.62, s*0.22, 0, 7); ctx.fill();
+        ctx.strokeStyle="#243140"; ctx.lineWidth=1; ctx.stroke();
+      }
       break;
     case "cow":
       ctx.fillStyle="#f0f0f0"; ctx.beginPath(); ctx.ellipse(cx,cy,s*0.55,s*0.4,0,0,7); ctx.fill();
