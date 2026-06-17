@@ -183,9 +183,9 @@ const MOUNT   = [150,150,156];
 const E_MIN = -2, E_MAX = 3;
 
 // ---------- terrain classification (depends on water flood) ----------
-function isWalkable(t){ return t && t.elev >= -1 && t.elev <= 2; } // -2 & +3 are impassable
+function isWalkable(t){ return !!t && (t.bridge || (t.elev >= -1 && t.elev <= 2)); } // -2 & +3 blocked unless bridged
 // movement cost: flat ground is fastest, each step up/down is slower (until impassable)
-function moveCost(t){ return 1 + Math.abs(t.elev); }            // 0->1, ±1->2, +2->3
+function moveCost(t){ return t.bridge ? 1 : 1 + Math.abs(t.elev); }   // bridges cross at full speed
 function speedWord(t){ const c=moveCost(t); return c===1?"normal speed":c===2?"slow":"very slow"; }
 function deepWater(t){ return t.wet && t.elev <= -2; }
 function shallowWater(t){ return t.wet && t.elev === -1; }
@@ -203,7 +203,7 @@ function tileName(t){
 }
 
 // ---------- game state ----------
-const START_RES = { food:12, milk:0, wood:8, stone:3, gold:6, leather:0 };
+const START_RES = { food:12, milk:0, wood:8, stone:3, gold:6, leather:0, tools:0 };
 const G = {
   map: new Map(),
   ents: [],
@@ -220,7 +220,7 @@ const G = {
 };
 let nextId = 1;
 const eid = ()=>"e"+(nextId++);
-const RADIUS = 4;
+const RADIUS = 5;
 const rnd = (n)=>Math.floor(Math.random()*n);
 const pick = (a)=>a[rnd(a.length)];
 
@@ -240,33 +240,92 @@ function computeWater(){
   }
 }
 
-// ---------- map generation ----------
+// ---------- procedural map generation ----------
+// elevation = sum of random peaks/basins (forms ranges & valleys) minus a
+// random coastline gradient (sea on one side); then a river is carved down
+// from the heights to the sea. Every new game is different.
+const fpx = t => t.q + t.r/2, fpy = t => t.r*0.8660254;
+function nearestSeaTile(from){
+  let best=null, bd=1e9;
+  for (const t of G.map.values()){ if(!t.isSea) continue; const d=hexDist(t,from); if(d<bd){ bd=d; best=t; } }
+  return best;
+}
+function carveRiver(cells){
+  const highs = cells.filter(t=>t.elev>=2 && !t.isSea);
+  if (!highs.length) return;
+  let cur = pick(highs); const visited=new Set(); const path=[];
+  for (let s=0; s<RADIUS*5; s++){
+    const k=key(cur.q,cur.r); if (visited.has(k)) break; visited.add(k); path.push(cur);
+    if (cur.isSea) break;
+    const nbrs = DIRS.map(([dq,dr])=>G.map.get(key(cur.q+dq,cur.r+dr))).filter(n=>n && !visited.has(key(n.q,n.r)));
+    if (!nbrs.length) break;
+    nbrs.sort((a,b)=>a._e-b._e);                 // flow downhill, sometimes meander
+    cur = (nbrs.length>1 && Math.random()<0.3) ? nbrs[1] : nbrs[0];
+  }
+  for (const t of path){ if(!t.isSea) t.elev = -2; }    // a deep, 1-wide river (needs a bridge)
+  // make sure it actually reaches the sea so the channel floods
+  const adjSea = t => DIRS.some(([dq,dr])=>{ const n=G.map.get(key(t.q+dq,t.r+dr)); return n && n.isSea; });
+  let last = path[path.length-1], guard=0;
+  while (last && !last.isSea && !adjSea(last) && guard++<RADIUS*5){
+    const sea = nearestSeaTile(last); if(!sea) break;
+    const nbrs = DIRS.map(([dq,dr])=>G.map.get(key(last.q+dq,last.r+dr))).filter(Boolean);
+    if (!nbrs.length) break;
+    nbrs.sort((a,b)=>hexDist(a,sea)-hexDist(b,sea));
+    const nx = nbrs[0]; if(!nx) break;
+    if (!nx.isSea) nx.elev = -2;
+    last = nx;
+  }
+}
 function genMap(){
   G.map.clear();
-  for (let q=-RADIUS; q<=RADIUS; q++){
-    for (let r=-RADIUS; r<=RADIUS; r++){
-      if (Math.abs(q+r) > RADIUS) continue;
-      const t = { q, r, elev:0, improve:null, isSea:false, wet:false };
-      const edge = q + r;
-      if (edge <= -3){ t.isSea = true; t.elev = -2; }      // the sea (deep, water source)
-      else if (edge === -2){ t.elev = -1; }                // coastline shallows
-      else {
-        const rr = Math.random();
-        if (rr < 0.06) t.elev = 2;                         // a few big hills
-        else if (rr < 0.20) t.elev = 1;                    // some small hills
-      }
-      G.map.set(key(q,r), t);
-    }
+  const cells=[];
+  for (let q=-RADIUS; q<=RADIUS; q++) for (let r=-RADIUS; r<=RADIUS; r++){
+    if (Math.abs(q+r) > RADIUS) continue;
+    const t = { q, r, elev:0, improve:null, isSea:false, wet:false, bridge:false };
+    G.map.set(key(q,r), t); cells.push(t);
   }
-  // scatter forests on flat / low-hill grass
-  let forests = 0;
-  for (const t of G.map.values()){
-    if (forests >= 6) break;
-    if (t.elev>=0 && t.elev<=1 && !t.improve && Math.random()<0.16){
-      t.improve = { kind:"forest", wood: 4 + rnd(4) }; forests++;
-    }
+  // random elevation features: peaks (ranges) and basins (valleys)
+  const feats=[];
+  for (let i=0, n=2+rnd(2); i<n; i++)
+    feats.push({ x:(Math.random()*2-1)*RADIUS*0.8, y:(Math.random()*2-1)*RADIUS*0.8, h:1.8+Math.random()*2.4, rad:1.4+Math.random()*1.7 });
+  for (let i=0, n=1+rnd(2); i<n; i++)
+    feats.push({ x:(Math.random()*2-1)*RADIUS*0.8, y:(Math.random()*2-1)*RADIUS*0.8, h:-(1.5+Math.random()*1.6), rad:1.4+Math.random()*1.5 });
+  // coastline: sink one random side into the sea
+  const ang=Math.random()*Math.PI*2, cd0=Math.cos(ang), cd1=Math.sin(ang);
+  let minP=1e9, maxP=-1e9;
+  for (const t of cells){ t._p=fpx(t)*cd0+fpy(t)*cd1; if(t._p<minP)minP=t._p; if(t._p>maxP)maxP=t._p; }
+  for (const t of cells){
+    let e=0.7;
+    for (const f of feats){ const dx=fpx(t)-f.x, dy=fpy(t)-f.y; e += f.h*Math.exp(-(dx*dx+dy*dy)/(2*f.rad*f.rad)); }
+    const pn=(t._p-minP)/((maxP-minP)||1);
+    e -= pn*pn*4.4;                       // far coast side drops into the sea
+    e += (Math.random()-0.5)*0.6;         // roughness
+    t._e=e;
   }
+  for (const t of cells) t.elev = Math.max(E_MIN, Math.min(E_MAX, Math.round(t._e)));
+  // ocean: flood inward from the low coastal border
+  const border = cells.filter(t=>hexDist(t,{q:0,r:0})===RADIUS);
+  let seeds = border.filter(t=>t.elev<=-1);
+  if (!seeds.length){ border.sort((a,b)=>a._e-b._e); border[0].elev=-2; seeds=[border[0]]; }
+  const ocean=new Set(), stack=[...seeds];
+  while (stack.length){
+    const t=stack.pop(), k=key(t.q,t.r); if (ocean.has(k)) continue; ocean.add(k);
+    for (const [dq,dr] of DIRS){ const n=G.map.get(key(t.q+dq,t.r+dr)); if(n && !ocean.has(key(n.q,n.r)) && n.elev<=-1) stack.push(n); }
+  }
+  for (const k of ocean){ const t=G.map.get(k); if (t.elev<=-2 || hexDist(t,{q:0,r:0})===RADIUS){ t.elev=-2; t.isSea=true; } }
+  if (![...ocean].some(k=>G.map.get(k).isSea)){ const t=G.map.get([...ocean][0]); if(t){ t.elev=-2; t.isSea=true; } }
+  // carve 1-2 rivers from the heights to the sea
+  for (let i=0, n=1+rnd(2); i<n; i++) carveRiver(cells);
   computeWater();
+  // forests clustered on low land
+  const land = cells.filter(t=>t.elev>=0 && t.elev<=1 && !t.isSea);
+  for (let c=0, n=3+rnd(3); c<n && land.length; c++){
+    const ctr=pick(land);
+    for (const t of [ctr, ...DIRS.map(([dq,dr])=>G.map.get(key(ctr.q+dq,ctr.r+dr)))]){
+      if (t && t.elev>=0 && t.elev<=1 && !t.improve && !t.isSea && Math.random()<0.55)
+        t.improve={kind:"forest", wood:4+rnd(4)};
+    }
+  }
 }
 
 // ---------- entities ----------
@@ -376,6 +435,29 @@ function stepToward(ent, goal, adjacentOk, speed){
   return false;
 }
 function warehouse(){ return G.ents.find(e=>e.type==="warehouse"); }
+// a deep-water tile is bridgeable only where it's a narrow crossing
+// (walkable land/bridge on two opposite sides) — i.e. a 1-wide river/strait
+function bridgeable(t){
+  if (!t || !t.wet || t.elev>-2 || t.bridge) return false;
+  const nb = DIRS.map(([dq,dr])=>G.map.get(key(t.q+dq,t.r+dr)));
+  for (let i=0;i<3;i++) if (isWalkable(nb[i]) && isWalkable(nb[i+3])) return true;
+  return false;
+}
+// is the warehouse linked by land/bridge to the outside world? if not, no trade
+function villageConnected(){
+  const wh = warehouse(); if (!wh) return false;
+  const seen=new Set([key(wh.q,wh.r)]); const q=[wh];
+  while (q.length){
+    const t=q.shift();
+    if (hexDist(t,{q:0,r:0})===RADIUS) return true;       // reached the map edge
+    for (const [dq,dr] of DIRS){
+      const n=G.map.get(key(t.q+dq,t.r+dr)); if(!n) continue;
+      const k=key(n.q,n.r); if (seen.has(k) || !isWalkable(n)) continue;
+      seen.add(k); q.push(n);
+    }
+  }
+  return false;
+}
 function nearestHouse(from){
   let best=null, bd=1e9;
   for (const e of G.ents){
@@ -438,7 +520,12 @@ function spawnEdgeHex(walkableOnly){
   return edge.length ? pick(edge) : null;
 }
 function spawnCows(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t) addEnt({type:"cow", q:t.q, r:t.r, timer:45+rnd(30)}); } }
-function spawnTrader(){ const t=spawnEdgeHex(true); if(t) addEnt({type:"trader", q:t.q, r:t.r, timer:38+rnd(20)}); }
+function spawnTrader(){
+  if (!villageConnected()) return false;             // cut-off villages get no traders
+  const t=spawnEdgeHex(true); if(!t) return false;
+  addEnt({type:"trader", q:t.q, r:t.r, timer:38+rnd(20), stock:{res:"tools", amt:2+rnd(3)}});
+  return true;
+}
 function spawnMarauders(n){ for(let i=0;i<n;i++){ const t=spawnEdgeHex(true); if(t){ const hp=2+rnd(2); addEnt({type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0, acd:0, spawn:{q:t.q,r:t.r}, thief:Math.random()<0.4, loot:null}); } } }
 function loseVillager(reason){
   const vs = G.ents.filter(e=>e.type==="villager");
@@ -454,10 +541,12 @@ function removeVillager(v){
   if (G.pop<=0){ G.over=true; flash("Your last villager is gone — game over."); }
 }
 function fireEvent(){
-  // space out raids/disasters: bad events need a cooldown, good ones fill the gaps
-  const bad = EVENTS.filter(e=>e.bad), good = EVENTS.filter(e=>!e.bad);
+  // a cut-off village gets no trader/merchant events; raids are spaced out
+  const usable = e => !e.trade || villageConnected();
+  const bad = EVENTS.filter(e=>e.bad && usable(e)), good = EVENTS.filter(e=>!e.bad && usable(e));
   let pool = good;
-  if (G.tick - (G.lastBadTick||-999) > 24 && Math.random()<0.5) pool = bad;
+  if (G.tick - (G.lastBadTick||-999) > 24 && Math.random()<0.5 && bad.length) pool = bad;
+  if (!pool.length) pool = good.length ? good : EVENTS.filter(usable);
   const ev = pick(pool);
   if (ev.bad) G.lastBadTick = G.tick;
   openEvent(ev);
@@ -734,11 +823,18 @@ function nearestCarrier(from){
 }
 // attackers: thieves are fast and hunt laden villagers; raiders raze inward to the warehouse
 function marauderAct(e){
+  // if the village is walled/bridged off and nothing can be reached, give up
+  if ((e.stuck||0) > 45){ removeEnt(e.id); log("🚪 Raiders found no way in and turned back."); return; }
+  const move = (goal, adj, spd) => {            // step, tracking unreachable targets
+    const r = stepToward(e, goal, adj, spd);
+    e.stuck = (r===null) ? (e.stuck||0)+1 : 0;
+    return r;
+  };
   const spd = e.thief ? 0.6 : 0.34;        // thieves are fleet-footed
   // carrying loot -> flee back the way they came, off the map
   if (e.loot){
     const goal = e.spawn || {q:e.q,r:e.r};
-    const arr = stepToward(e, goal, false, spd);
+    const arr = move(goal, false, spd);
     if (arr===true || hexDist(e,{q:0,r:0})>=RADIUS){
       log("🏴‍☠️ Raiders escaped with "+e.loot.amt+" "+e.loot.res+"!");
       flash("Raiders made off with your "+e.loot.res+"!");
@@ -756,13 +852,13 @@ function marauderAct(e){
         log("🏴‍☠️ A thief waylaid a villager and stole their load!");
         flash("A thief robbed one of your villagers!");
         if (villagerFightsBack(carrier, e)) return;   // villager may drive the thief off
-      } else stepToward(e, {q:carrier.q,r:carrier.r}, true, spd);
+      } else move({q:carrier.q,r:carrier.r}, true, spd);
       return;
     }
     // 2) else snatch a dropped load lying in the open
     const item = nearestEntOfType(e, "item");
     if (item){
-      const arr = stepToward(e, {q:item.q,r:item.r}, false, spd);
+      const arr = move({q:item.q,r:item.r}, false, spd);
       if (arr===true){ e.loot={res:item.res, amt:item.amt}; removeEnt(item.id); log("🏴‍☠️ A thief snatched a dropped load!"); }
       return;
     }
@@ -770,7 +866,7 @@ function marauderAct(e){
     const wh = warehouse();
     if (wh){
       if (hexDist(e,wh)<=1){ const loot=grabFromWarehouse(); if (loot){ e.loot=loot; log("🏴‍☠️ A thief grabbed "+loot.amt+" "+loot.res+" from the warehouse!"); } }
-      else stepToward(e, {q:wh.q,r:wh.r}, true, spd);
+      else move({q:wh.q,r:wh.r}, true, spd);
     }
     return;
   }
@@ -790,7 +886,7 @@ function marauderAct(e){
       if (tgt.hp<=0) destroyBuilding(tgt);
     }
   } else {
-    stepToward(e, {q:tgt.q,r:tgt.r}, true, spd);
+    move({q:tgt.q,r:tgt.r}, true, spd);
   }
 }
 
@@ -816,13 +912,13 @@ function floodTiles(){
 }
 
 // ---------- watchtower placement & crewing ----------
-const TOWER_COST = { wood:6, stone:4 };
+const TOWER_COST = { wood:6, stone:4, tools:2 };       // tools come only from traders
 function tryPlaceTower(h){
   const t = G.map.get(key(h.q,h.r));
   const occupied = G.ents.some(e=>e.q===h.q&&e.r===h.r);
   if (!t || !isWalkable(t) || t.improve || occupied){ flash("Pick an empty, walkable tile."); return; }
-  if (G.res.wood<TOWER_COST.wood || G.res.stone<TOWER_COST.stone){ flash("Need 6 wood and 4 stone."); G.placing=null; return; }
-  G.res.wood-=TOWER_COST.wood; G.res.stone-=TOWER_COST.stone;
+  if (!can(TOWER_COST)){ flash("Need 6🪵 4🪨 2🛠️ (trade for tools)."); G.placing=null; return; }
+  pay(TOWER_COST);
   const tw = addEnt({ type:"watchtower", q:h.q, r:h.r, built:false, crew:null, cd:0, range:3, hp:6, maxhp:6 });
   G.placing=null;
   assignNearest("buildtower", tw);
@@ -844,7 +940,7 @@ function handleInstant(v){
     tq=te.q; tr=te.r;
   }
   const tile = G.map.get(key(tq,tr));
-  const adj = (tk.kind==="raise"||tk.kind==="lower") ? true : !isWalkable(tile);
+  const adj = (tk.kind==="raise"||tk.kind==="lower"||tk.kind==="bridge"||tk.kind==="unbridge") ? true : !isWalkable(tile);
   const arr = stepToward(v, {q:tq,r:tr}, adj, 1);
   if (arr===null){ v.task=null; flash("A villager can't reach that."); return; }
   if (!arr) return;
@@ -881,6 +977,12 @@ function doWork(v, tk, tq, tr){
         flash("New house built!");
       }
       break;
+    case "bridge":
+      if (v.work>=4){ tile.bridge=true; v.task=null; log("🌉 A bridge now spans the water."); flash("Bridge built!"); }
+      break;
+    case "unbridge":
+      if (v.work>=2){ tile.bridge=false; v.task=null; log("🌉 The bridge was dismantled."); }
+      break;
     case "trade": {
       const tr2 = G.ents.find(e=>e.id===tk.targetId);
       if (!tr2){ v.task=null; break; }
@@ -892,8 +994,15 @@ function doWork(v, tk, tq, tr){
         if (gold>0){
           G.res.milk -= sellMilk; G.res.leather -= sellLeather; G.res.food -= sellFood; G.res.gold += gold;
           log("🪙 Sold goods to traders for "+gold+" gold.");
-          flash("+"+gold+" gold from trade!");
-        } else flash("Nothing to sell.");
+        }
+        // buy trade-only goods (e.g. tools) — the only way to obtain them
+        let bought=0;
+        if (tr2.stock){
+          const price=3;
+          while (tr2.stock.amt>0 && G.res.gold>=price){ G.res[tr2.stock.res]=(G.res[tr2.stock.res]||0)+1; G.res.gold-=price; tr2.stock.amt--; bought++; }
+          if (bought) log("🛠️ Bought "+bought+" "+tr2.stock.res+" from the trader.");
+        }
+        flash(gold>0||bought ? "Traded: +"+gold+"🪙"+(bought?", +"+bought+" "+tr2.stock.res:"") : "Nothing to trade.");
         v.task=null;
       }
       break;
@@ -941,6 +1050,7 @@ function renderStats(){
     ["🪵","Wood", Math.floor(G.res.wood)],
     ["🪨","Stone", Math.floor(G.res.stone)],
     ["🟫","Hide", Math.floor(G.res.leather)],
+    ["🛠️","Tools", Math.floor(G.res.tools)],
     ["🪙","Gold", Math.floor(G.res.gold)],
     ["🧑","Pop", G.pop+"/"+houseCount()],
   ];
@@ -954,16 +1064,16 @@ const can = (cost)=>Object.keys(cost).every(k=>G.res[k]>=cost[k]);
 const pay = (cost)=>{ for(const k in cost) G.res[k]-=cost[k]; };
 const EVENTS = [
   { title:"A Lord's Decree",
-    text:"A passing lord, impressed by your thriving village, grants you leave to fortify these lands. Will you raise a watchtower to guard against raiders?",
+    text:"A passing lord, impressed by your thriving village, grants you leave to fortify these lands. Will you raise a watchtower to guard against raiders? (You'll need tools — buy them from traders.)",
     options:[
-      { label:"⚔ Accept the honour", fn:()=>{ G.placing="watchtower"; flash("Tap an empty tile to place your watchtower (6🪵 4🪨)."); } },
+      { label:"⚔ Accept the honour", fn:()=>{ G.placing="watchtower"; flash("Tap an empty tile to place your watchtower (6🪵 4🪨 2🛠️)."); } },
       { label:"Politely decline", fn:()=>{} },
     ] },
-  { title:"Travelling Merchant",
-    text:"A merchant with a laden cart stops at your gate, eager to deal before nightfall.",
+  { title:"Travelling Merchant", trade:true,
+    text:"A merchant with a laden cart stops at your gate. Among his wares are sturdy tools you cannot make yourselves.",
     options:[
+      { label:"Buy 3 tools (9🪙)", fn:()=>{ if(can({gold:9})){ pay({gold:9}); G.res.tools+=3; } else flash("Not enough gold."); } },
       { label:"Buy 6 food (5🪙)", fn:()=>{ if(can({gold:5})){ pay({gold:5}); G.res.food+=6; } else flash("Not enough gold."); } },
-      { label:"Buy 5 wood (5🪙)", fn:()=>{ if(can({gold:5})){ pay({gold:5}); G.res.wood+=5; } else flash("Not enough gold."); } },
       { label:"Send him on his way", fn:()=>{} },
     ] },
   { title:"Bandit Threat", bad:true,
@@ -996,10 +1106,10 @@ const EVENTS = [
       { label:"Let them graze", fn:()=>{ spawnCows(1+rnd(2)); flash("Send a farmer to tend them."); } },
       { label:"Shoo them off", fn:()=>{} },
     ] },
-  { title:"A Trade Caravan",
-    text:"Merchants make camp at the village edge, eager to barter your wares.",
+  { title:"A Trade Caravan", trade:true,
+    text:"Merchants make camp at the village edge, their mules laden with tools and trade goods.",
     options:[
-      { label:"Invite them in", fn:()=>{ spawnTrader(); flash("Send a villager to trade."); } },
+      { label:"Invite them in", fn:()=>{ if(spawnTrader()) flash("Send a villager to trade for tools."); else flash("The village is cut off — they can't reach you."); } },
       { label:"Ignore them", fn:()=>{} },
     ] },
   { title:"Marauders Sighted!", bad:true,
@@ -1035,7 +1145,7 @@ const EVENTS = [
       { label:"Hunt it (+6 food)", fn:()=>{ if(Math.random()<0.25){ flash("The boar gored a villager!"); loseVillager("☠️ The boar killed a hunter."); } else { G.res.food+=6; flash("The boar is felled! +6 food"); } } },
       { label:"Let it pass", fn:()=>{} },
     ] },
-  { title:"Wandering Bard",
+  { title:"Wandering Bard", trade:true,
     text:"A bard offers songs of far-off lands in exchange for a warm hearth and a coin.",
     options:[
       { label:"Welcome the bard (+3 gold of trade)", fn:()=>{ G.res.gold+=3; } },
@@ -1104,9 +1214,10 @@ function refreshPanel(){
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
 
   if (ent && ent.type==="warehouse"){
+    const trade = villageConnected();
     selEl.innerHTML = "<b>🏛️ Warehouse (HQ)</b>"+(ent.hp<ent.maxhp?` · ❤️ ${ent.hp}/${ent.maxhp}`:"")+"<br>"
-      + `🌾 ${Math.floor(G.res.food)} food · 🥛 ${Math.floor(G.res.milk)} milk · 🪵 ${Math.floor(G.res.wood)} wood · 🪨 ${Math.floor(G.res.stone)} stone · 🟫 ${Math.floor(G.res.leather)} hide · 🪙 ${Math.floor(G.res.gold)} gold · 🧑 ${G.pop}/${houseCount()}`
-      + "<br><span style='font-size:11px'>"+(G.alarm?"Alarm raised — hold or tap to stand down.":"Hold the warehouse to ring the alarm bell.")+"</span>";
+      + `🌾 ${Math.floor(G.res.food)} · 🥛 ${Math.floor(G.res.milk)} · 🪵 ${Math.floor(G.res.wood)} · 🪨 ${Math.floor(G.res.stone)} · 🟫 ${Math.floor(G.res.leather)} · 🛠️ ${Math.floor(G.res.tools)} · 🪙 ${Math.floor(G.res.gold)} · 🧑 ${G.pop}/${houseCount()}`
+      + "<br><span style='font-size:11px'>"+(trade?"🛣️ Trade routes open.":"⛔ Cut off — no traders can reach you.")+" "+(G.alarm?"Alarm raised.":"Hold to ring the alarm.")+"</span>";
     acts.push({label: G.alarm?"✅ All clear":"🔔 Sound alarm", cls: G.alarm?"go":"down", fn:()=>toggleAlarm()});
     renderActions(acts); return;
   }
@@ -1164,6 +1275,14 @@ function refreshPanel(){
     acts.push({label:"🏠 Build house (3🪵 2🪨)", fn:()=>{
       if (!can({wood:3,stone:2})){flash("Need 3 wood, 2 stone.");return;}
       pay({wood:3,stone:2}); assignTask("build",{q:h.q,r:h.r});
+    }});
+  // bridges over a narrow river / strait
+  if (t.bridge && !ent)
+    acts.push({label:"🌉 Remove bridge", cls:"down", fn:()=>assignTask("unbridge",{q:h.q,r:h.r})});
+  else if (bridgeable(t) && !ent)
+    acts.push({label:"🌉 Build bridge (3🪵)", fn:()=>{
+      if (!can({wood:3})){flash("Need 3 wood.");return;}
+      pay({wood:3}); assignTask("bridge",{q:h.q,r:h.r});
     }});
   renderActions(acts);
 }
@@ -1367,6 +1486,7 @@ function draw(){
       else if (t.improve.kind==="farm") drawFarm(cx, topY);
       else if (t.improve.kind==="quarry") drawQuarry(cx, topY);
     }
+    if (t.bridge) drawBridge(cx, baseY);
     if (G.selHex && G.selHex.q===t.q && G.selHex.r===t.r){
       poly(top); ctx.lineWidth=3; ctx.strokeStyle="#ffe066"; ctx.stroke();
     }
@@ -1544,6 +1664,13 @@ function drawQuarry(cx,cy){
   for (const off of [[-0.18,0.05],[0.2,-0.05],[0.02,0.2]]){
     ctx.beginPath(); ctx.arc(cx+off[0]*HEX, cy+off[1]*HEX, HEX*0.12, 0, 7); ctx.fill();
   }
+}
+function drawBridge(cx,cy){
+  const w=HEX*1.12, hh=HEX*0.42;
+  ctx.fillStyle="#7a5230"; ctx.strokeStyle="#3f2a14"; ctx.lineWidth=1.2;
+  ctx.fillRect(cx-w/2, cy-hh/2, w, hh); ctx.strokeRect(cx-w/2, cy-hh/2, w, hh);
+  ctx.strokeStyle="#5c3d1e"; ctx.lineWidth=1;
+  for (let i=1;i<5;i++){ const x=cx-w/2+i*w/5; ctx.beginPath(); ctx.moveTo(x,cy-hh/2); ctx.lineTo(x,cy+hh/2); ctx.stroke(); }
 }
 
 // ---------- boot ----------
