@@ -142,6 +142,9 @@ const E_MIN = -2, E_MAX = 3;
 
 // ---------- terrain classification (depends on water flood) ----------
 function isWalkable(t){ return t && t.elev >= -1 && t.elev <= 2; } // -2 & +3 are impassable
+// movement cost: flat ground is fastest, each step up/down is slower (until impassable)
+function moveCost(t){ return 1 + Math.abs(t.elev); }            // 0->1, ±1->2, +2->3
+function speedWord(t){ const c=moveCost(t); return c===1?"normal speed":c===2?"slow":"very slow"; }
 function deepWater(t){ return t.wet && t.elev <= -2; }
 function shallowWater(t){ return t.wet && t.elev === -1; }
 function quarry(t){ return !t.wet && t.elev <= -2; }
@@ -248,7 +251,7 @@ function spawnVillager(q,r){
     const t = G.map.get(key(q+dq,r+dr));
     if (t && isWalkable(t) && !entAt(t.q,t.r,"villager")){ spot={q:t.q,r:t.r}; break; }
   }
-  return addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0 });
+  return addEnt({ type:"villager", q:spot.q, r:spot.r, task:null, work:0, mp:0 });
 }
 
 // ---------- pathfinding (BFS over walkable) ----------
@@ -333,7 +336,7 @@ function fireEvent(){
   } else {
     const t = spawnEdgeHex(true); if(!t) return;
     const hp = 2 + rnd(2);
-    addEnt({ type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, moveCd: 3 });
+    addEnt({ type:"marauder", q:t.q, r:t.r, hp, maxhp:hp, mp:0 });
     log("⚔️ Marauders approach the village! Fight them, or wall them out with hills & water.");
     flash("⚔️ Marauders approach!");
   }
@@ -364,9 +367,12 @@ function logicTick(){
     if (!atTarget){
       const step = bfsNext({q:v.q,r:v.r}, {q:tq,r:tr}, needAdjacent);
       if (!step){ v.task=null; flash("A villager can't reach that."); continue; }
-      v.q = step.q; v.r = step.r;
+      v.mp = Math.min((v.mp||0) + 1, 3);                  // 1 move point per tick
+      const cost = moveCost(G.map.get(key(step.q,step.r)));
+      if (v.mp >= cost){ v.mp -= cost; v.q = step.q; v.r = step.r; }
       continue;
     }
+    v.mp = 0;
     v.work++;
     doWork(v, tk, tq, tr);
   }
@@ -377,18 +383,19 @@ function logicTick(){
     } else if (e.type==="trader"){
       if (--e.timer<=0){ removeEnt(e.id); log("🛒 The traders moved on."); }
     } else if (e.type==="marauder"){
-      if (--e.moveCd<=0){
-        e.moveCd = 3;
-        if (house){
-          const step = bfsNext({q:e.q,r:e.r}, {q:house.q,r:house.r}, true);
-          if (step){ e.q=step.q; e.r=step.r; }
-          if (hexDist(e,house)<=1){
-            G.res.food = Math.max(0, G.res.food-3);
-            G.res.gold = Math.max(0, G.res.gold-2);
-            removeEnt(e.id);
-            log("💥 Marauders raided the village! Lost food and gold.");
-            flash("💥 Your village was raided!");
-          }
+      if (house){
+        e.mp = Math.min((e.mp||0) + 0.34, 3);            // slower base pace; hills slow them further
+        const step = bfsNext({q:e.q,r:e.r}, {q:house.q,r:house.r}, true);
+        if (step){
+          const cost = moveCost(G.map.get(key(step.q,step.r)));
+          if (e.mp >= cost){ e.mp -= cost; e.q=step.q; e.r=step.r; }
+        }
+        if (hexDist(e,house)<=1){
+          G.res.food = Math.max(0, G.res.food-3);
+          G.res.gold = Math.max(0, G.res.gold-2);
+          removeEnt(e.id);
+          log("💥 Marauders raided the village! Lost food and gold.");
+          flash("💥 Your village was raided!");
         }
       }
     }
@@ -558,7 +565,7 @@ function refreshPanel(){
   if (!t){ G.selHex=null; renderActions([]); return; }
   const ent = G.ents.find(e=>e.q===h.q&&e.r===h.r);
   let desc = `<b>${tileName(t)}</b> · elev ${t.elev>0?"+":""}${t.elev}`;
-  if (!isWalkable(t)) desc += " · impassable";
+  desc += isWalkable(t) ? " · "+speedWord(t) : " · impassable";
   if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest"
                        : t.improve.kind==="quarry" ? " · ⛏️ stone"
                        : " · 🌾 farm";
