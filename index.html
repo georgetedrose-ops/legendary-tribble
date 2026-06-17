@@ -238,11 +238,11 @@ function setupStart(){
     }
   }
   if (!home){ home = G.map.get(key(0,0)); home.elev = 0; home.isSea=false; computeWater(); }
-  addEnt({ type:"house", q:home.q, r:home.r });
+  addEnt({ type:"warehouse", q:home.q, r:home.r });   // central HQ — all resources deposit here
   spawnVillager(home.q, home.r);
   spawnVillager(home.q, home.r);
   G.pop = 2;
-  log("Your village begins: one house, two villagers. Shape the land and survive.");
+  log("Your village begins at the warehouse. Tap it for stats; hold it to sound the alarm.");
 }
 
 function spawnVillager(q,r){
@@ -255,19 +255,19 @@ function spawnVillager(q,r){
 }
 
 // ---------- pathfinding: least-cost (Dijkstra over move costs) ----------
-// Returns the first step on the QUICKEST (lowest travel-time) path, honouring
-// per-tile move cost so routes prefer flat ground and avoid slow hills /
-// impassable rivers. goalAdjacentOk = stop on any tile next to the goal.
-function findStep(from, goal, goalAdjacentOk){
-  if (from.q===goal.q && from.r===goal.r) return null;
+// Returns the full QUICKEST (lowest travel-time) path as an array of cells
+// (from the next step to the goal), honouring per-tile move cost so routes
+// prefer flat ground and avoid slow hills / impassable rivers.
+// goalAdjacentOk = stop on any tile next to the goal.
+function findPath(from, goal, goalAdjacentOk){
+  if (from.q===goal.q && from.r===goal.r) return [];
   const start = key(from.q,from.r);
   const dist = new Map([[start,0]]);
   const prev = new Map([[start,null]]);
   const pq = [{k:start, q:from.q, r:from.r, d:0}];
   let reached = null;
   while (pq.length){
-    // pop lowest-cost node (small grid: linear scan is fine)
-    let bi=0; for (let i=1;i<pq.length;i++) if (pq[i].d<pq[bi].d) bi=i;
+    let bi=0; for (let i=1;i<pq.length;i++) if (pq[i].d<pq[bi].d) bi=i;  // small grid: linear pop
     const cur = pq.splice(bi,1)[0];
     if (cur.d > (dist.get(cur.k) ?? Infinity)) continue;
     if (cur.q===goal.q && cur.r===goal.r){ reached=cur.k; break; }
@@ -285,27 +285,29 @@ function findStep(from, goal, goalAdjacentOk){
     }
   }
   if (!reached) return null;
-  let k = reached, p = prev.get(k);
-  if (p === start || p == null){ const [q,r]=k.split(",").map(Number); return {q,r}; }
-  while (p && p !== start){ k = p; p = prev.get(k); }
-  const [q,r] = k.split(",").map(Number);
-  return {q,r};
+  const cells = []; let k = reached;
+  while (k && k !== start){ const [q,r]=k.split(",").map(Number); cells.unshift({q,r}); k = prev.get(k); }
+  return cells;
 }
 
-// move one ent toward goal using accumulated move points; returns
+// move one ent toward goal using accumulated move points; caches the planned
+// path on ent.pathCells (for the on-map path line). Returns
 // true = arrived, false = still travelling, null = no path.
 function stepToward(ent, goal, adjacentOk, speed){
-  if (ent.q===goal.q && ent.r===goal.r) return true;
-  if (adjacentOk && hexDist(ent,goal)===1) return true;
-  const step = findStep({q:ent.q,r:ent.r}, goal, adjacentOk);
-  if (!step) return null;
+  if (ent.q===goal.q && ent.r===goal.r){ ent.pathCells=null; return true; }
+  if (adjacentOk && hexDist(ent,goal)===1){ ent.pathCells=null; return true; }
+  const path = findPath({q:ent.q,r:ent.r}, goal, adjacentOk);
+  if (!path || !path.length){ ent.pathCells=null; return null; }
+  ent.pathCells = path;
+  const step = path[0];
   ent.mp = Math.min((ent.mp||0) + speed, 3);
   const cost = moveCost(G.map.get(key(step.q,step.r)));
   if (ent.mp >= cost){ ent.mp -= cost; ent.q = step.q; ent.r = step.r; }
-  if (ent.q===goal.q && ent.r===goal.r) return true;
-  if (adjacentOk && hexDist(ent,goal)===1) return true;
+  if (ent.q===goal.q && ent.r===goal.r){ ent.pathCells=null; return true; }
+  if (adjacentOk && hexDist(ent,goal)===1){ ent.pathCells=null; return true; }
   return false;
 }
+function warehouse(){ return G.ents.find(e=>e.type==="warehouse"); }
 function nearestHouse(from){
   let best=null, bd=1e9;
   for (const e of G.ents){
@@ -315,6 +317,8 @@ function nearestHouse(from){
   }
   return best;
 }
+// all resources are deposited at the warehouse (HQ); fall back to a house
+function depotFor(from){ return warehouse() || nearestHouse(from); }
 
 // ---------- villager command ----------
 function nearestIdleVillager(q,r){
@@ -385,13 +389,14 @@ function fireEvent(){
 function logicTick(){
   if (G.over) return;
   G.tick++;
-  const house = G.ents.find(e=>e.type==="house");
+  const hq = warehouse() || G.ents.find(e=>e.type==="house");   // raid/spawn anchor
 
   if (--G.nextEvent <= 0){ fireEvent(); G.nextEvent = 16 + rnd(14); }
 
   for (const v of G.ents){
     if (v.type!=="villager" || !v.task) continue;
-    if (GATHER[v.task.kind]) handleGather(v);
+    if (v.task.kind==="return") handleReturn(v);
+    else if (GATHER[v.task.kind]) handleGather(v);
     else handleInstant(v);
   }
 
@@ -411,15 +416,15 @@ function logicTick(){
     } else if (e.type==="trader"){
       if (--e.timer<=0){ removeEnt(e.id); log("🛒 The traders moved on."); }
     } else if (e.type==="marauder"){
-      if (house){
+      if (hq){
         // cost-aware path: marauders flow around hills and impassable rivers
-        const arr = stepToward(e, {q:house.q,r:house.r}, true, 0.34);
-        if (hexDist(e,house)<=1){
+        stepToward(e, {q:hq.q,r:hq.r}, true, 0.34);
+        if (hexDist(e,hq)<=1){
           G.res.food = Math.max(0, G.res.food-3);
           G.res.gold = Math.max(0, G.res.gold-2);
           removeEnt(e.id);
-          log("💥 Marauders raided the village! Lost food and gold.");
-          flash("💥 Your village was raided!");
+          log("💥 Marauders raided the warehouse! Lost food and gold.");
+          flash("💥 Your warehouse was raided!");
         }
       }
     }
@@ -438,7 +443,7 @@ function logicTick(){
 
   if (G.res.food >= 12 && G.pop < G.popCap){
     G.res.food -= 10; G.pop++;
-    if (house){ spawnVillager(house.q, house.r); log("👶 A new villager joins the village!"); flash("A new villager is born!"); }
+    if (hq){ spawnVillager(hq.q, hq.r); log("👶 A new villager joins the village!"); flash("A new villager is born!"); }
   }
 
   if (G.tick % 10 === 0) G.day++;
@@ -483,16 +488,34 @@ function handleGather(v){
     return;
   }
   if (job.phase==="home"){
-    const house = nearestHouse(v);
-    if (!house){ v.task=null; return; }
-    const arr = stepToward(v, {q:house.q,r:house.r}, true, 1);
-    if (arr===null){ v.task=null; flash("A villager is stranded from home."); return; }
+    const depot = depotFor(v);
+    if (!depot){ v.task=null; return; }
+    const arr = stepToward(v, {q:depot.q,r:depot.r}, true, 1);
+    if (arr===null){ v.task=null; flash("A villager is stranded from the warehouse."); return; }
     if (arr){
-      if (v.carry){ G.res[v.carry.res] += v.carry.amt; log("📦 Deposited "+v.carry.amt+" "+v.carry.res+"."); v.carry=null; }
+      if (v.carry){ G.res[v.carry.res] += v.carry.amt; log("📦 Deposited "+v.carry.amt+" "+v.carry.res+" at the warehouse."); v.carry=null; }
       if (job.done){ v.task=null; return; }               // site exhausted
       job.phase="go"; v.work=0;                            // loop for another load
     }
   }
+}
+
+// alarm: every villager drops what they're doing and returns to the warehouse
+function handleReturn(v){
+  const depot = depotFor(v);
+  if (!depot){ v.task=null; return; }
+  const arr = stepToward(v, {q:depot.q,r:depot.r}, true, 1);
+  if (arr===null){ v.task=null; return; }
+  if (arr){
+    if (v.carry){ G.res[v.carry.res] += v.carry.amt; v.carry=null; }
+    v.task=null;
+  }
+}
+function ringBell(){
+  const wh = warehouse(); if (!wh) return;
+  flash("🔔 Alarm! Villagers returning to the village.");
+  log("🔔 The alarm bell rings — every villager rushes back to the warehouse.");
+  for (const v of G.ents) if (v.type==="villager"){ v.task={kind:"return"}; v.work=0; }
 }
 
 // instant jobs act in place once the villager arrives
@@ -632,6 +655,14 @@ function refreshPanel(){
   if (t.improve) desc += t.improve.kind==="forest" ? " · 🌲 forest"
                        : t.improve.kind==="quarry" ? " · ⛏️ stone"
                        : " · 🌾 farm";
+  if (ent && ent.type==="warehouse"){
+    selEl.innerHTML = "<b>🏛️ Warehouse (HQ)</b> — "
+      + `🌾 ${Math.floor(G.res.food)} · 🥛 ${Math.floor(G.res.milk)} · 🪵 ${Math.floor(G.res.wood)} · 🪙 ${Math.floor(G.res.gold)} · 🧑 ${G.pop}/${G.popCap}`
+      + "<br><span style='font-size:11px'>Hold the warehouse to ring the alarm bell.</span>";
+    acts.push({label:"⚒️ Ready villager", cls:"go", fn:()=>{ G.ready=true; flash("Villager ready — pick a target."); refreshPanel(); }});
+    acts.push({label:"🔔 Sound alarm", cls:"down", fn:()=>ringBell()});
+    renderActions(acts); return;
+  }
   if (ent) desc += " · "+entLabel(ent.type);
   if (ent && ent.type==="villager") desc += " — "+villagerStatus(ent);
   selEl.innerHTML = desc;
@@ -664,10 +695,11 @@ function refreshPanel(){
   renderActions(acts);
 }
 function entLabel(t){
-  return { house:"🏠 house", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder" }[t]||t;
+  return { warehouse:"🏛️ warehouse", house:"🏠 house", villager:"🧑 villager", cow:"🐄 cows", trader:"🛒 traders", marauder:"⚔️ marauder" }[t]||t;
 }
 function villagerStatus(v){
   if (!v.task) return "idle";
+  if (v.task.kind==="return") return "returning to the village";
   const g = GATHER[v.task.kind];
   if (g){
     if (v.carry || v.task.phase==="home") return "hauling "+g.res+" home";
@@ -699,9 +731,19 @@ function evToHex(clientX, clientY){
   const h = pixelToHex(px, py);
   return G.map.has(key(h.q,h.r)) ? h : null;
 }
-function onDown(x,y){ down = { x, y, hex: evToHex(x,y) }; }
+let holdT = null;
+function clearHold(){ if (holdT){ clearTimeout(holdT); holdT=null; } }
+function onDown(x,y){
+  down = { x, y, hex: evToHex(x,y), held:false };
+  clearHold();
+  const onWh = down.hex && G.ents.some(e=>e.type==="warehouse"&&e.q===down.hex.q&&e.r===down.hex.r);
+  if (onWh) holdT = setTimeout(()=>{ if(down){ down.held=true; ringBell(); } }, 550);  // hold to ring bell
+}
+function onMove(x,y){ if (down && Math.hypot(x-down.x, y-down.y) > 12) clearHold(); }
 function onUp(x,y){
+  clearHold();
   if (!down) return;
+  if (down.held){ down=null; return; }            // long-press already handled (alarm)
   const dx = x-down.x, dy = y-down.y;
   const dist = Math.hypot(dx,dy);
   const h = down.hex; down = null;
@@ -729,8 +771,9 @@ function handleTap(h){
   refreshPanel();
 }
 cv.addEventListener("pointerdown",e=>onDown(e.clientX,e.clientY));
+cv.addEventListener("pointermove",e=>onMove(e.clientX,e.clientY));
 cv.addEventListener("pointerup",e=>onUp(e.clientX,e.clientY));
-cv.addEventListener("pointercancel",()=>{ down=null; });
+cv.addEventListener("pointercancel",()=>{ clearHold(); down=null; });
 cv.addEventListener("contextmenu",e=>e.preventDefault());
 
 // ---------- colour helpers ----------
@@ -842,7 +885,7 @@ function draw(){
       }
     }
 
-    poly(top); ctx.lineWidth=1; ctx.strokeStyle="rgba(0,0,0,.22)"; ctx.stroke();
+    poly(top); ctx.lineWidth=1; ctx.strokeStyle="rgba(150,160,172,0.45)"; ctx.stroke();  // 1px grey tile outline
 
     if (t.improve){
       if (t.improve.kind==="forest") drawTrees(cx, topY);
@@ -854,23 +897,63 @@ function draw(){
     }
   }
 
-  const ents = [...G.ents].sort((a,b)=>{
-    const ta=G.map.get(key(a.q,a.r)), tb=G.map.get(key(b.q,b.r));
-    return (ta.r-tb.r)||(ta.q-tb.q);
-  });
+  updateAnim();
+  drawPaths();
+
+  const ents = [...G.ents].sort((a,b)=> (a.ay-b.ay) || (a.ax-b.ax));
   for (const e of ents){
-    const t = G.map.get(key(e.q,e.r)); if(!t) continue;
-    const p = hexToPixel(e.q,e.r);
-    const lift = t.elev>0 ? t.elev*ELEV : 0;
-    const cx=p.x+cam.x, cy=p.y+cam.y - lift - HEX*0.18;
+    const lift = liftOf(e.q,e.r);
+    const cx = e.ax+cam.x, cy = e.ay+cam.y - lift - HEX*0.18;
     drawEntity(e, cx, cy);
   }
   requestAnimationFrame(draw);
 }
 
+function liftOf(q,r){ const t=G.map.get(key(q,r)); return t && t.elev>0 ? t.elev*ELEV : 0; }
+
+// ease each entity's drawn pixel position toward its current hex (smooth sliding)
+function updateAnim(){
+  for (const e of G.ents){
+    const p = hexToPixel(e.q,e.r);
+    if (e.ax===undefined){ e.ax=p.x; e.ay=p.y; }
+    else { e.ax += (p.x-e.ax)*0.2; e.ay += (p.y-e.ay)*0.2; }
+  }
+}
+
+// faint dotted path lines along planned routes
+function drawPaths(){
+  ctx.save(); ctx.setLineDash([3,5]); ctx.lineWidth=1.5;
+  for (const e of G.ents){
+    if (!e.pathCells || !e.pathCells.length) continue;
+    if (e.type!=="villager" && e.type!=="marauder") continue;
+    ctx.strokeStyle = e.type==="marauder" ? "rgba(227,96,79,0.40)" : "rgba(235,242,251,0.30)";
+    ctx.beginPath();
+    ctx.moveTo(e.ax+cam.x, e.ay+cam.y - liftOf(e.q,e.r) - HEX*0.1);
+    for (const c of e.pathCells){
+      const p = hexToPixel(c.q,c.r);
+      ctx.lineTo(p.x+cam.x, p.y+cam.y - liftOf(c.q,c.r) - HEX*0.1);
+    }
+    ctx.stroke();
+  }
+  ctx.restore(); ctx.setLineDash([]);
+}
+
 function drawEntity(e,cx,cy){
   const s = HEX*0.42;
   switch(e.type){
+    case "warehouse": {
+      // stone HQ with a tall spire and a bell on top
+      ctx.fillStyle="#837b6f"; ctx.strokeStyle="#34302a"; ctx.lineWidth=1.5;
+      ctx.fillRect(cx-s*0.85, cy-s*0.55, s*1.7, s*1.15); ctx.strokeRect(cx-s*0.85, cy-s*0.55, s*1.7, s*1.15);
+      ctx.fillStyle="#b1b8c0";                            // door
+      ctx.fillRect(cx-s*0.22, cy-s*0.02, s*0.44, s*0.62);
+      ctx.fillStyle="#9c5b3a"; ctx.strokeStyle="#5c3320"; // spire
+      ctx.beginPath(); ctx.moveTo(cx-s*0.55, cy-s*0.55); ctx.lineTo(cx, cy-s*1.95); ctx.lineTo(cx+s*0.55, cy-s*0.55); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle="#f2c94c"; ctx.beginPath(); ctx.arc(cx, cy-s*1.9, s*0.18, 0, 7); ctx.fill();   // bell
+      ctx.strokeStyle="#7a5e18"; ctx.stroke();
+      break;
+    }
     case "house":
       ctx.fillStyle="#8a5a32"; ctx.strokeStyle="#3a2412"; ctx.lineWidth=1.5;
       ctx.fillRect(cx-s*0.7, cy-s*0.55, s*1.4, s*1.1); ctx.strokeRect(cx-s*0.7, cy-s*0.55, s*1.4, s*1.1);
