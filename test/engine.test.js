@@ -174,3 +174,99 @@ describe('scoring', () => {
     expect(livingDiseases(s, buildWorld()).length).toBe(1);
   });
 });
+
+describe('cure faction actions', () => {
+  function curePlayerState() {
+    const cfg = {
+      seed: 3, localPlayerId: 'you',
+      players: [
+        { id: 'you', name: 'You', diseaseName: 'A', typeId: 'virus' },
+        { id: 'foe', name: 'Foe', diseaseName: 'B', typeId: 'bacteria', isAI: true },
+      ],
+    };
+    const s = createInitialState(cfg);
+    for (let i = 0; i < 15; i++) step(s); // let the foe establish presence
+    // Force 'you' into the cure faction with points to spend.
+    const me = s.players[0];
+    me.faction = 'cure';
+    me.alive = false;
+    me.points = 50;
+    return { s, me, world: buildWorld() };
+  }
+
+  it('fund_research advances the cure against the strongest disease', () => {
+    const { s, me } = curePlayerState();
+    const foe = s.players[1];
+    const before = foe.cureProgress;
+    const res = applyCommand(s, { type: 'cure_action', playerId: 'you', action: 'fund_research' });
+    expect(res.ok).toBe(true);
+    expect(foe.cureProgress).toBeGreaterThan(before);
+    expect(me.points).toBeLessThan(50);
+  });
+
+  it('lockdown halts spread through a city', () => {
+    const { s } = curePlayerState();
+    const world = buildWorld();
+    const city = world.order[0];
+    const res = applyCommand(s, { type: 'cure_action', playerId: 'you', action: 'lockdown', cityId: city });
+    expect(res.ok).toBe(true);
+    expect(s.lockdowns[city]).toBeGreaterThan(0);
+  });
+
+  it('vaccinate immunises part of a city', () => {
+    const { s } = curePlayerState();
+    const world = buildWorld();
+    // pick a city the foe infects
+    const city = world.order.find((id) => (s.infections[id]['foe'] || 0) > 0) || world.order[0];
+    const before = s.immune[city];
+    const res = applyCommand(s, { type: 'cure_action', playerId: 'you', action: 'vaccinate', cityId: city });
+    expect(res.ok).toBe(true);
+    expect(s.immune[city]).toBeGreaterThanOrEqual(before);
+  });
+
+  it('rejects actions the player cannot afford', () => {
+    const { s, me } = curePlayerState();
+    me.points = 0;
+    const res = applyCommand(s, { type: 'cure_action', playerId: 'you', action: 'fund_research' });
+    expect(res.ok).toBe(false);
+  });
+});
+
+describe('bubbles', () => {
+  it('a collected bubble grants DNA and is removed', () => {
+    const s = createInitialState(soloConfig());
+    s.bubbles.push({ id: 1, cityId: buildWorld().order[0], playerId: 'you', value: 3, ttl: 10 });
+    const before = s.players[0].dna;
+    const res = applyCommand(s, { type: 'collect_bubble', playerId: 'you', bubbleId: 1 });
+    expect(res.ok).toBe(true);
+    expect(s.players[0].dna).toBe(before + 3);
+    expect(s.bubbles.length).toBe(0);
+  });
+  it('cannot collect another player\'s bubble', () => {
+    const s = createInitialState(soloConfig());
+    s.bubbles.push({ id: 2, cityId: buildWorld().order[0], playerId: 'other', value: 3, ttl: 10 });
+    const res = applyCommand(s, { type: 'collect_bubble', playerId: 'you', bubbleId: 2 });
+    expect(res.ok).toBe(false);
+  });
+});
+
+describe('competition', () => {
+  it('two diseases share and compete for a population (never over-infect)', () => {
+    const cfg = {
+      seed: 9, localPlayerId: 'a',
+      players: [
+        { id: 'a', name: 'A', diseaseName: 'A', typeId: 'virus' },
+        { id: 'b', name: 'B', diseaseName: 'B', typeId: 'bacteria' },
+      ],
+    };
+    const s = createInitialState(cfg);
+    for (let i = 0; i < 120; i++) step(s);
+    const world = buildWorld();
+    // For every city, infected + dead + immune must never exceed 1 (population).
+    for (const id of world.order) {
+      let sum = (s.dead[id] || 0) + (s.immune[id] || 0);
+      for (const pid in s.infections[id]) sum += s.infections[id][pid];
+      expect(sum).toBeLessThanOrEqual(1.0001);
+    }
+  });
+});

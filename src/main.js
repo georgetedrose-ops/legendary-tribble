@@ -343,8 +343,13 @@ function renderGame(runner) {
   }
 
   renderPanel();
-  // Smooth redraw for bubble pulse even while paused.
-  (function raf() { if (!session.runner || session.runner !== runner) return; mapView.draw(runner.state); requestAnimationFrame(raf); })();
+  // Smooth redraw for bubble pulse even while paused. Stops itself once this
+  // game's canvas leaves the DOM (e.g. on game over / quit) to avoid a leak.
+  (function raf() {
+    if (session.runner !== runner || !document.body.contains(canvas)) return;
+    mapView.draw(runner.state);
+    requestAnimationFrame(raf);
+  })();
 }
 
 function statBox(label) {
