@@ -21,8 +21,14 @@ npm run dev        # http://localhost:5173  — play vs AI immediately
 - **Pick a username**, choose how many AI rivals, and hit **Play vs AI**.
 - **Name your disease** and choose a starting strain (Bacteria, Virus, Parasite,
   Prion, Nanovirus, Bioweapon) — each plays differently.
-- **Spread & evolve:** earn DNA as you infect and kill, then spend it in the
-  three-branch skill tree — **Transmission**, **Symptoms**, **Resilience**.
+- **Spread & evolve:** earn DNA as you infect and kill, then spend it in a deep
+  **53-node, four-branch skill tree** — **Transmission**, **Symptoms**,
+  **Resilience**, **Mutation**. You can't afford it all, and several capstones
+  are *mutually exclusive*, so every match you commit to a different path to
+  victory (airborne blitz, silent killer, cure-proof endurer, economy engine…).
+- **Watch it spread:** a real world map with country outlines, each player's
+  disease colour-coded, and planes/ships/road traffic carrying the infection
+  between capitals in real time.
 - **Mind the cure:** the more visible and deadly you are, the faster the world
   researches a cure. Stay stealthy or out-pace them.
 - **Lose and fight on:** if your plague is wiped out you join the **Cure**

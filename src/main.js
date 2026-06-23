@@ -5,7 +5,7 @@ import { OnlineTransport, createRoom, joinRoom } from './net/online.js';
 import { MapView } from './ui/map.js';
 import { buildWorld } from './engine/state.js';
 import { DISEASE_TYPES } from './data/diseaseTypes.js';
-import { SKILL_NODES, getNode, prereqsMet } from './data/skillTree.js';
+import { SKILL_NODES, getNode, prereqsMet, nodeExclusivityLocked, BRANCHES } from './data/skillTree.js';
 import { TICK, LIMITS, CURE } from './engine/constants.js';
 import { worldDeadFraction } from './engine/scoring.js';
 
@@ -169,6 +169,7 @@ function startGame(config, transport) {
 function renderGame(runner) {
   clear();
   let activeTab = 'evolve';
+  let activeBranch = 'transmission'; // which skill-tree branch is shown
   let cureTarget = null; // selected city id for cure actions
 
   // ── topbar ──
@@ -234,31 +235,54 @@ function renderGame(runner) {
 
   function renderEvolvePanel(me) {
     if (me.faction === 'cure') return;
-    const branches = ['transmission', 'symptoms', 'resilience'];
-    const titles = { transmission: '🦠 Transmission', symptoms: '☠ Symptoms', resilience: '🛡 Resilience' };
-    for (const br of branches) {
-      const wrap = h('div', { class: 'branch' }, h('h3', {}, titles[br]));
-      const nodes = SKILL_NODES.filter((n) => n.branch === br).sort((a, b) => a.tier - b.tier);
-      for (const node of nodes) {
+
+    // Branch selector — one branch shown at a time so the 50+ node tree stays
+    // readable. A dot shows how many nodes you own in each branch.
+    const branchTabs = h('div', { class: 'branch-tabs' });
+    for (const b of BRANCHES) {
+      const ownedInBranch = SKILL_NODES.filter((n) => n.branch === b.id && me.owned.includes(n.id)).length;
+      branchTabs.append(h('button', { class: 'branch-tab' + (b.id === activeBranch ? ' on' : ''),
+        onclick: () => { activeBranch = b.id; renderPanel(); } },
+        h('span', { class: 'bicon' }, b.icon),
+        h('span', {}, b.name),
+        ownedInBranch ? h('span', { class: 'bcount' }, ownedInBranch) : null));
+    }
+    panel.append(branchTabs);
+
+    // Nodes of the active branch, grouped by tier so prerequisite depth reads
+    // top-to-bottom like a real tech tree.
+    const nodes = SKILL_NODES.filter((n) => n.branch === activeBranch);
+    const tiers = [...new Set(nodes.map((n) => n.tier))].sort((a, b) => a - b);
+    const tierName = { 1: 'Tier I', 2: 'Tier II', 3: 'Tier III', 4: 'Tier IV — fork', 5: 'Tier V — capstone' };
+    for (const tier of tiers) {
+      const wrap = h('div', { class: 'branch' }, h('h3', {}, tierName[tier] || `Tier ${tier}`));
+      for (const node of nodes.filter((n) => n.tier === tier)) {
         const owned = me.owned.includes(node.id);
         const ready = prereqsMet(node.id, me.owned);
+        const excluded = nodeExclusivityLocked(node.id, me.owned);
         const afford = me.dna >= node.cost;
-        // 'cant' = unlocked but currently too expensive (dimmed, still shown).
-        const cls = 'node' + (owned ? ' owned' : !ready ? ' locked' : !afford ? ' cant' : '');
-        wrap.append(h('div', { class: cls, title: node.req.length ? 'Requires: ' + node.req.map((r) => getNode(r).name).join(', ') : '',
-          // Recompute eligibility live at click time so accumulating DNA always
-          // lets you buy, regardless of when the panel was last drawn.
+        const isCapstone = Array.isArray(node.special) && node.special.length > 0;
+        let cls = 'node';
+        if (owned) cls += ' owned';
+        else if (excluded) cls += ' excluded';
+        else if (!ready) cls += ' locked';
+        else if (!afford) cls += ' cant';
+        if (isCapstone) cls += ' capstone';
+        const reqNote = node.req.length ? 'Requires: ' + node.req.map((r) => getNode(r).name).join(', ') : '';
+        const exNote = (node.exclusiveWith || []).length ? 'Locks out: ' + node.exclusiveWith.map((r) => getNode(r).name).join(', ') : '';
+        wrap.append(h('div', { class: cls, title: [reqNote, exNote].filter(Boolean).join('  •  '),
           onclick: () => {
             const live = runner.localPlayer();
             if (live.faction !== 'disease') return;
-            if (live.owned.includes(node.id)) return;
-            if (!prereqsMet(node.id, live.owned)) return;
-            if (live.dna < node.cost) return;
+            if (live.owned.includes(node.id) || !prereqsMet(node.id, live.owned)) return;
+            if (nodeExclusivityLocked(node.id, live.owned) || live.dna < node.cost) return;
             runner.submit({ type: 'evolve', playerId: live.id, nodeId: node.id });
             renderPanel();
           } },
-          h('div', { class: 'ninfo' }, h('div', { class: 'nname' }, node.name), h('div', { class: 'ndesc' }, node.desc)),
-          h('div', { class: 'ncost' }, owned ? '✓' : `${node.cost}`)));
+          h('div', { class: 'ninfo' },
+            h('div', { class: 'nname' }, (isCapstone ? '★ ' : '') + node.name),
+            h('div', { class: 'ndesc' }, excluded ? 'Locked — conflicts with a path you chose.' : node.desc)),
+          h('div', { class: 'ncost' }, owned ? '✓' : excluded ? '✕' : `${node.cost}`)));
       }
       panel.append(wrap);
     }
@@ -290,8 +314,9 @@ function renderGame(runner) {
   // visibly update (newly affordable nodes, owned set, cure points/target).
   const panelSig = (me) => {
     if (me.faction === 'cure') return `C|${Math.floor(me.points)}|${cureTarget || '-'}`;
-    const buyable = SKILL_NODES.filter((n) => !me.owned.includes(n.id) && prereqsMet(n.id, me.owned) && me.dna >= n.cost).map((n) => n.id).join(',');
-    return `D|${me.owned.length}|${buyable}`;
+    const buyable = SKILL_NODES.filter((n) => !me.owned.includes(n.id) && prereqsMet(n.id, me.owned)
+      && !nodeExclusivityLocked(n.id, me.owned) && me.dna >= n.cost).map((n) => n.id).join(',');
+    return `D|${activeBranch}|${me.owned.length}|${buyable}`;
   };
   const unsub = runner.onChange((state) => {
     const me = runner.localPlayer();

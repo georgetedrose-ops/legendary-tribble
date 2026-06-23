@@ -102,7 +102,8 @@ export function createInitialState(config) {
       name: p.name,
       diseaseName: p.diseaseName || `${type.name} ${idx + 1}`,
       typeId: type.id,
-      color: type.color,
+      color: PLAYER_COLORS[idx % PLAYER_COLORS.length],
+      typeColor: type.color, // representative colour of the strain (for flavour)
       isAI: !!p.isAI,
       faction: 'disease', // 'disease' | 'cure'
       alive: true,
@@ -110,6 +111,7 @@ export function createInitialState(config) {
       startCity: start,
       stats: cloneStats(type.base),
       trait: type.trait.id,
+      flags: [], // capstone 'special' abilities unlocked via the skill tree
       owned: [],
       dna: 0,
       points: 0, // cure-faction research points (after elimination)
@@ -135,3 +137,8 @@ export function createInitialState(config) {
 export function getPlayer(state, id) {
   return state.players.find((p) => p.id === id);
 }
+
+// Distinct, high-contrast player colours assigned by slot, independent of the
+// chosen disease type — so two players who both pick "Virus" are still visually
+// distinguishable on the map. Order chosen for maximum separation.
+export const PLAYER_COLORS = ['#ff4d5e', '#36d1dc', '#7be36b', '#ffd23f', '#b07bff', '#ff8c42'];

@@ -18,7 +18,14 @@ function envMult(player, city) {
   else m = 1.0;
   // Bacteria's "Hardened Shell" softens climate penalties.
   if (player.trait === 'hardened' && m < 1) m = 1 - (1 - m) * 0.6;
+  // "Extremophile" capstone removes climate penalties entirely.
+  if (m < 1 && hasFlag(player, 'extremophile')) m = 1.0;
   return Math.max(0.25, Math.min(1.15, m));
+}
+
+// Does a player have a given capstone special ability unlocked?
+function hasFlag(player, flag) {
+  return player.flags && player.flags.includes(flag);
 }
 
 // Bonus to cross-border export along a link, based on the relevant vector.
@@ -57,15 +64,16 @@ export function step(state) {
   for (const id of world.order) snap[id] = { ...state.infections[id] };
 
   // ── 1. Cross-border migration (Risk-style spread along links) ──
+  // A lockdown normally severs a city's links. The "aerosol" capstone lets a
+  // disease keep crossing AIR links even through locked-down cities.
   for (const id of world.order) {
-    if (state.lockdowns[id] > 0) continue; // a locked-down city neither sends nor receives
-    const city = world.cities[id];
     for (const link of world.adjacency[id]) {
       const dst = link.to;
       if (dst < id) continue; // handle each undirected pair once
-      if (state.lockdowns[dst] > 0) continue;
+      const locked = state.lockdowns[id] > 0 || state.lockdowns[dst] > 0;
       const weight = WORLD.LINK_WEIGHT[link.kind];
       for (const p of diseases) {
+        if (locked && !(link.kind === 'air' && hasFlag(p, 'aerosol'))) continue;
         const Ia = snap[id][p.id] || 0;
         const Ib = snap[dst][p.id] || 0;
         const broadcast = p.trait === 'broadcast';
@@ -81,7 +89,6 @@ export function step(state) {
         }
       }
     }
-    void city;
   }
 
   // ── 2. Within-city growth, deaths, and cure-driven recovery ──
@@ -149,10 +156,13 @@ export function step(state) {
     const killM = newKilledMillions[p.id];
     p.infectedTotal += infM;
     p.killedTotal += killM;
+    // "fast_metabolism" doubles passive income; "necrosis" boosts kill income.
+    const passive = DISEASE.DNA_PER_TICK * (hasFlag(p, 'fast_metabolism') ? 2.2 : 1);
+    const killMult = hasFlag(p, 'necrosis') ? 1.6 : 1;
     const income =
-      DISEASE.DNA_PER_TICK +
+      passive +
       infM * DISEASE.DNA_PER_MILLION_INFECTED +
-      killM * DISEASE.DNA_PER_MILLION_KILLED;
+      killM * DISEASE.DNA_PER_MILLION_KILLED * killMult;
     p.dna += income;
 
     // Virus mutates: occasional free micro-boosts.
@@ -166,6 +176,7 @@ export function step(state) {
     // Attention rises with severity and fresh deaths; some types stay quiet.
     let attn = p.stats.severity * CURE.ATTENTION_PER_SEVERITY + killM * CURE.ATTENTION_PER_DEATH_MILLION;
     if (p.trait === 'stealth') attn *= 0.7;
+    if (hasFlag(p, 'asymptomatic')) attn *= 0.5; // capstone: stay under the radar
     p.attention = Math.min(100, p.attention + attn);
 
     // Cure research: faster when wealthy cities are infected; resist.drug and
@@ -180,8 +191,9 @@ export function step(state) {
     }
     const drugMod = Math.max(0.2, 1 - p.stats.resist.drug);
     const neuralMod = p.trait === 'neural' ? 0.65 : 1;
+    const immunityMod = hasFlag(p, 'drug_immunity') ? 0.4 : 1; // capstone: cripple the cure
     const research =
-      CURE.BASE_RATE * (p.attention / 100) * (1 + richExposure * 0.15) * drugMod * neuralMod;
+      CURE.BASE_RATE * (p.attention / 100) * (1 + richExposure * 0.15) * drugMod * neuralMod * immunityMod;
     p.cureProgress = Math.min(100, p.cureProgress + research);
   }
 
@@ -264,10 +276,16 @@ export function applyCommand(state, cmd) {
       if (!node) return { ok: false, error: 'unknown node' };
       if (player.owned.includes(node.id)) return { ok: false, error: 'already owned' };
       if (!prereqsMet(node.id, player.owned)) return { ok: false, error: 'prereqs not met' };
+      if (isExclusivityLocked(node, player.owned)) return { ok: false, error: 'conflicts with an evolution you already have' };
       if (player.dna < node.cost) return { ok: false, error: 'not enough DNA' };
       player.dna -= node.cost;
       player.owned.push(node.id);
-      applyEffects(player.stats, node.effects, +1);
+      if (node.effects) applyEffects(player.stats, node.effects, +1);
+      // Capstone "special" abilities are recorded as flags the sim reads.
+      if (Array.isArray(node.special)) {
+        if (!player.flags) player.flags = [];
+        for (const f of node.special) if (!player.flags.includes(f)) player.flags.push(f);
+      }
       return { ok: true };
     }
     case 'collect_bubble': {
@@ -334,6 +352,17 @@ function strongestDisease(state, world) {
     }
   }
   return best;
+}
+
+// True if buying `node` is blocked by a mutually-exclusive choice: either the
+// node excludes something already owned, or an owned node excludes this one.
+export function isExclusivityLocked(node, owned) {
+  if (Array.isArray(node.exclusiveWith) && node.exclusiveWith.some((id) => owned.includes(id))) return true;
+  for (const ownedId of owned) {
+    const o = getNode(ownedId);
+    if (o && Array.isArray(o.exclusiveWith) && o.exclusiveWith.includes(node.id)) return true;
+  }
+  return false;
 }
 
 // Apply dotted-key additive effects to a stats object. sign +1 buys, -1 refunds.

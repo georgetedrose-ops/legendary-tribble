@@ -16,7 +16,13 @@ await p.click('text=Release into the wild');
 await p.waitForSelector('#map');
 const speed = await p.$$('.speed .btn');
 await speed[speed.length - 1].click();
-await p.waitForTimeout(9000); // let the world light up
+await p.waitForTimeout(14000); // let the world light up and travel sprites fly
 await p.screenshot({ path: `${out}/03-game.png` });
+// Capture the evolution tree (Mutation branch to show variety).
+await p.click('.speed .btn >> nth=0'); // pause
+const mut = await p.$('.branch-tab:has-text("Mutation")');
+if (mut) await mut.click();
+await p.waitForTimeout(400);
+await p.screenshot({ path: `${out}/04-tree.png` });
 await b.close();
 console.log('shots written to', out);

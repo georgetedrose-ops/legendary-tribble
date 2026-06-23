@@ -1,4 +1,4 @@
-import { SKILL_NODES, prereqsMet } from '../data/skillTree.js';
+import { SKILL_NODES, prereqsMet, nodeExclusivityLocked } from '../data/skillTree.js';
 import { buildWorld } from './state.js';
 
 // Lightweight, deterministic AI. Each bot is given a "personality" derived from
@@ -8,10 +8,14 @@ import { buildWorld } from './state.js';
 // AI decisions are throttled (every few ticks) by the caller; this function
 // just decides what to do *now* given current state.
 
+// Branch priority orders. The strongest branch is pursued first so bots commit
+// (buying its cheapest available node each step) and naturally climb toward a
+// capstone rather than scattering DNA evenly.
 const PERSONALITIES = {
-  spreader: ['transmission', 'symptoms', 'resilience'],
-  killer: ['symptoms', 'resilience', 'transmission'],
-  survivor: ['resilience', 'transmission', 'symptoms'],
+  spreader: ['transmission', 'mutation', 'symptoms', 'resilience'],
+  killer: ['symptoms', 'mutation', 'resilience', 'transmission'],
+  survivor: ['resilience', 'symptoms', 'transmission', 'mutation'],
+  schemer: ['mutation', 'transmission', 'resilience', 'symptoms'],
 };
 
 function personalityFor(player) {
@@ -35,13 +39,15 @@ export function computeAICommands(state, player) {
     // bots build coherent diseases rather than scattering points.
     const order = personalityFor(player);
     const affordable = SKILL_NODES.filter(
-      (n) => !player.owned.includes(n.id) && prereqsMet(n.id, player.owned) && player.dna >= n.cost,
+      (n) => !player.owned.includes(n.id) && prereqsMet(n.id, player.owned)
+        && !nodeExclusivityLocked(n.id, player.owned) && player.dna >= n.cost,
     );
     if (affordable.length) {
       affordable.sort((a, b) => {
         const pa = order.indexOf(a.branch);
         const pb = order.indexOf(b.branch);
         if (pa !== pb) return pa - pb;
+        if (a.tier !== b.tier) return a.tier - b.tier; // climb the chosen branch
         return a.cost - b.cost;
       });
       // Don't blow everything at once early; keep a small reserve.

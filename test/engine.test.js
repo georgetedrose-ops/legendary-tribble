@@ -4,7 +4,7 @@ import { createInitialState, buildWorld } from '../src/engine/state.js';
 import { step, applyCommand, applyEffects } from '../src/engine/sim.js';
 import { computeAICommands } from '../src/engine/ai.js';
 import { worldDeadFraction, livingDiseases } from '../src/engine/scoring.js';
-import { getNode } from '../src/data/skillTree.js';
+import { getNode, SKILL_NODES, BRANCHES, nodeExclusivityLocked, prereqsMet } from '../src/data/skillTree.js';
 
 function soloConfig(typeId = 'virus', seed = 42) {
   return { seed, localPlayerId: 'you', players: [{ id: 'you', name: 'Me', diseaseName: 'Test', typeId }] };
@@ -172,6 +172,87 @@ describe('scoring', () => {
   it('living diseases are counted correctly', () => {
     const s = createInitialState(soloConfig());
     expect(livingDiseases(s, buildWorld()).length).toBe(1);
+  });
+});
+
+describe('skill tree integrity', () => {
+  const ALLOWED_EFFECTS = new Set([
+    'infectivity', 'severity', 'lethality',
+    'vectors.air', 'vectors.water', 'vectors.animal',
+    'resist.heat', 'resist.cold', 'resist.drug',
+  ]);
+  const ALLOWED_SPECIALS = new Set(['necrosis', 'fast_metabolism', 'aerosol', 'extremophile', 'drug_immunity', 'asymptomatic']);
+  const ids = new Set(SKILL_NODES.map((n) => n.id));
+
+  it('has a large branching tree', () => {
+    expect(SKILL_NODES.length).toBeGreaterThanOrEqual(48);
+    expect(BRANCHES.length).toBe(4);
+  });
+  it('every req and exclusiveWith id exists and is in a valid branch', () => {
+    const branchIds = new Set(BRANCHES.map((b) => b.id));
+    for (const n of SKILL_NODES) {
+      expect(branchIds.has(n.branch)).toBe(true);
+      for (const r of n.req) expect(ids.has(r)).toBe(true);
+      for (const x of n.exclusiveWith || []) expect(ids.has(x)).toBe(true);
+    }
+  });
+  it('only uses effect keys and special flags the engine understands', () => {
+    for (const n of SKILL_NODES) {
+      for (const k of Object.keys(n.effects || {})) expect(ALLOWED_EFFECTS.has(k)).toBe(true);
+      for (const s of n.special || []) expect(ALLOWED_SPECIALS.has(s)).toBe(true);
+    }
+  });
+  it('requirements always point to strictly lower tiers (no cycles)', () => {
+    for (const n of SKILL_NODES) {
+      for (const r of n.req) expect(getNode(r).tier).toBeLessThan(n.tier);
+    }
+  });
+  it('total cost forces meaningful choices (cannot buy everything)', () => {
+    const total = SKILL_NODES.reduce((s, n) => s + n.cost, 0);
+    expect(total).toBeGreaterThan(1000);
+  });
+});
+
+describe('exclusivity & capstone flags', () => {
+  function disease(typeId = 'virus') {
+    return createInitialState({ seed: 1, localPlayerId: 'you', players: [{ id: 'you', name: 'Me', diseaseName: 'X', typeId }] });
+  }
+  // Find a symmetric exclusive pair from the data.
+  function anExclusivePair() {
+    for (const n of SKILL_NODES) {
+      if ((n.exclusiveWith || []).length) return [n, getNode(n.exclusiveWith[0])];
+    }
+    return null;
+  }
+
+  it('buying one side of a fork locks out the other', () => {
+    const [a, b] = anExclusivePair();
+    const s = disease();
+    const me = s.players[0];
+    me.dna = 9999;
+    me.owned = [...a.req]; // satisfy prereqs of a
+    const r1 = applyCommand(s, { type: 'evolve', playerId: 'you', nodeId: a.id });
+    expect(r1.ok).toBe(true);
+    expect(nodeExclusivityLocked(b.id, me.owned)).toBe(true);
+    me.owned.push(...b.req.filter((x) => !me.owned.includes(x)));
+    const r2 = applyCommand(s, { type: 'evolve', playerId: 'you', nodeId: b.id });
+    expect(r2.ok).toBe(false);
+  });
+
+  it('buying a capstone unlocks its special flag', () => {
+    const capstone = SKILL_NODES.find((n) => (n.special || []).length);
+    const s = disease();
+    const me = s.players[0];
+    me.dna = 99999;
+    // Walk the prereq chain so we can legally buy the capstone.
+    const chainBuy = (id) => {
+      const node = getNode(id);
+      for (const r of node.req) if (!me.owned.includes(r)) chainBuy(r);
+      if (!me.owned.includes(id)) applyCommand(s, { type: 'evolve', playerId: 'you', nodeId: id });
+    };
+    chainBuy(capstone.id);
+    expect(me.owned).toContain(capstone.id);
+    for (const f of capstone.special) expect(me.flags).toContain(f);
   });
 });
 

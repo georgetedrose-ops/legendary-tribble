@@ -73,7 +73,7 @@ try {
   for (let i = 0; i < 12 && dna < 8; i++) { await page.waitForTimeout(1500); dna = await dnaVal(); }
   await page.click('.speed .btn >> nth=0'); // pause to click safely
   const ownedBefore = (await page.$$('.node.owned')).length;
-  const cheap = await page.$('.node:not(.owned):not(.locked)');
+  const cheap = await page.$('.node:not(.owned):not(.locked):not(.cant):not(.excluded)');
   if (cheap) {
     await cheap.click();
     await page.waitForTimeout(200);
